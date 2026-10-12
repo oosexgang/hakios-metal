@@ -73,7 +73,10 @@ enum {
 
 #define kFBNotifyVSync          5
 #define kFBNotifyTypes          8
-#define kFBRefreshHz            60
+#define kFBRefreshHz            60                      /* unless boot-arg fb_hz says otherwise */
+
+#define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
+#define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
 
@@ -120,6 +123,14 @@ static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
 static TUNABLE(uint32_t, gRecSeconds, "rec_secs", 0);
 static TUNABLE(uint32_t, gRecStart, "rec_start", 0);
 static TUNABLE(uint32_t, gRecMegabytes, "rec_mb", 480);
+static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
+static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
+
+static inline uint32_t
+refreshHz(void)
+{
+	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
+}
 #define REC_STEP        3
 
 struct rec_header {
@@ -157,10 +168,18 @@ public:
 	MiniIOSurface * fDefaultSurface;
 	uint32_t        fSwapID;
 	uint32_t        fSwapsShown;
+	uint32_t        fLayersShown;           /* which layers the last swap had a surface in */
 	bool            fGraphics;              /* the text console has been told to stop */
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
 	uint64_t        fStatSince, fStatDrawing;
+	/* ... and how evenly: the time from each frame to the next, counted by the millisecond (the last count: longer) */
+	uint64_t        fLastFrame;
+	uint32_t        fFrameTimes[FRAME_TIMES + 1], fFramePauses, fFrameLongest;
+	/* boot-arg fb_diff=1: which pixels of the panel each frame changed (it costs: the panel's memory is slow to read) */
+	bool            fDiff;
+	uint64_t        fDiffPixels;
+	uint32_t        fDiffLeft, fDiffTop, fDiffRight, fDiffBottom;
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
 	uint8_t *       fRecBase;
@@ -172,6 +191,7 @@ public:
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
+	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void record(MiniIOSurface * s);
 };
@@ -192,7 +212,7 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
 /*
  * The modes of the display, the way CoreAnimation reads them (the properties TimingElements
  * and ColorElements; without a mode it draws nothing). One timing, the panel's size at
- * 60 Hz, with one colour mode, 8-bit RGB. The identifiers are what "the current mode"
+ * 60 Hz (boot-arg fb_hz=N: at N), with one colour mode, 8-bit RGB. The identifiers are what "the current mode"
  * (block 0x40) answers with.
  */
 #define kFBTimingID     1
@@ -207,7 +227,7 @@ IOMobileFramebuffer::publishModes(void)
 	OSDictionary * color = OSDictionary::withCapacity(8);
 	OSArray * timings = OSArray::withCapacity(1);
 	OSArray * colors = OSArray::withCapacity(1);
-	const uint32_t rate = kFBRefreshHz << 16;               /* 16.16 fixed point */
+	const uint32_t rate = refreshHz() << 16;                /* 16.16 fixed point */
 
 	if (timing == NULL || horizontal == NULL || vertical == NULL || color == NULL || timings == NULL || colors == NULL) {
 		return;
@@ -284,6 +304,8 @@ IOMobileFramebuffer::start(IOService * provider)
 		}
 	}
 	fColumn = IONewZero(uint32_t, fPanelWidth);
+	fDiff = gDiff != 0;
+	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
 
@@ -432,10 +454,59 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 			memcpy(to + px0, from + sx, (size_t) sw * 4);
 			continue;
 		}
+		if (fDiff) {
+			for (int32_t x = cx0; x < cx1; x++) {
+				if (to[x] != from[fColumn[x]]) {
+					fDiffPixels++;
+					fDiffLeft = (uint32_t) x < fDiffLeft ? (uint32_t) x : fDiffLeft;
+					fDiffRight = (uint32_t) x > fDiffRight ? (uint32_t) x : fDiffRight;
+					fDiffTop = (uint32_t) y < fDiffTop ? (uint32_t) y : fDiffTop;
+					fDiffBottom = (uint32_t) y > fDiffBottom ? (uint32_t) y : fDiffBottom;
+				}
+			}
+		}
 		for (int32_t x = cx0; x < cx1; x++) {
 			to[x] = from[fColumn[x]];
 		}
 	}
+}
+
+/*
+ * How evenly the frames of the last seconds came: how many followed the one before within the
+ * time of one refresh at 120, 60, 40 and 30 a second, and the times half and 95 in 100 of them
+ * stayed under. With the lock held.
+ */
+void
+IOMobileFramebuffer::reportFrameTimes(void)
+{
+	static const uint32_t limits[] = { 10, 18, 26, 35, FRAME_TIMES + 1 };
+	uint32_t within[sizeof(limits) / sizeof(limits[0])] = { 0 }, total = 0, sum = 0, half = 0, most = 0;
+
+	for (uint32_t ms = 0; ms <= FRAME_TIMES; ms++) {
+		for (uint32_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+			if (ms < limits[i]) {
+				within[i] += fFrameTimes[ms];
+				break;
+			}
+		}
+		total += fFrameTimes[ms];
+	}
+	for (uint32_t ms = 0; ms <= FRAME_TIMES && total != 0; ms++) {
+		sum += fFrameTimes[ms];
+		if (half == 0 && 2 * sum >= total) {
+			half = ms + 1;
+		}
+		if (most == 0 && 100 * sum >= 95 * total) {
+			most = ms + 1;
+		}
+	}
+	if (total != 0) {
+		IOLog("MiniIOMobileFramebuffer: from one frame to the next: %u times under 10 ms, %u under 18, %u under 26, %u under 35, "
+		    "%u longer (the longest %u ms); half under %u ms, 95 in 100 under %u ms; %u pauses\n", within[0], within[1],
+		    within[2], within[3], within[4], fFrameLongest, half, most, fFramePauses);
+	}
+	bzero(fFrameTimes, sizeof(fFrameTimes));
+	fFramePauses = fFrameLongest = 0;
 }
 
 void
@@ -443,9 +514,21 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos;
+	uint32_t layers = 0;
 	bool report;
 
 	IOLockLock(fLock);
+	if (fLastFrame != 0) {
+		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
+		nanos /= NSEC_PER_MSEC;
+		if (nanos >= FRAME_PAUSE) {
+			fFramePauses++;
+		} else {
+			fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
+			fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
+		}
+	}
+	fLastFrame = began;
 	report = fSwapsShown < 8;
 	if (report) {
 		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
@@ -457,6 +540,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		int32_t src[4], dst[4];
 		MiniIOSurface * s;
 
+		layers |= sid != 0 ? 1u << layer : 0;
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
 			if (layer == 0 && (set & 1) && fGraphics) {
@@ -494,6 +578,12 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		MiniIOSurfaceDrop(s);
 	}
 	fSwapsShown++;
+	if (layers != fLayersShown) {
+		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
+		    fLayersShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
+		    swapWord(swap, SWAP_SURFACE(3)));
+		fLayersShown = layers;
+	}
 
 	/* every five seconds in which something was drawn: how many frames, and what each cost here */
 	fStatFrames++;
@@ -508,6 +598,14 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver\n", fStatFrames,
 		    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC);
+		reportFrameTimes();
+		if (fDiff) {
+			IOLog("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
+			    fDiffPixels / fStatFrames, fDiffLeft, fDiffTop, fDiffRight, fDiffBottom);
+			fDiffPixels = 0;
+			fDiffLeft = fDiffTop = ~0u;
+			fDiffRight = fDiffBottom = 0;
+		}
 		fStatFrames = 0;
 		fStatDrawing = 0;
 		fStatSince = 0;
@@ -529,6 +627,7 @@ class IOMobileFramebufferUserClient : public IOUserClient
 	io_user_reference_t     fRefcons[kFBNotifyTypes];
 	thread_call_t           fVSyncCall;
 	uint64_t                fVSyncCount;
+	uint64_t                fVSyncTime;             /* when the refresh being waited for is due */
 	bool                    fVSyncRunning;
 	bool                    fClosed;
 
@@ -637,10 +736,15 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
 void
 IOMobileFramebufferUserClient::armVSync(void)
 {
-	uint64_t deadline;
+	uint64_t period, now = mach_absolute_time();
 
-	clock_interval_to_deadline(1000000 / kFBRefreshHz, NSEC_PER_USEC, &deadline);
-	thread_call_enter_delayed(fVSyncCall, deadline);
+	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+	fVSyncTime += period;
+	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
+		fVSyncTime = now + period;
+	}
+	thread_call_enter_delayed(fVSyncCall, fVSyncTime);
 }
 
 /*
@@ -652,10 +756,11 @@ IOMobileFramebufferUserClient::vsync(void)
 {
 	OSAsyncReference64 ref;
 	io_user_reference_t args[6];
-	uint64_t now = mach_absolute_time();
+	uint64_t now;
 	bool send = false;
 
 	IOLockLock(fLock);
+	now = fVSyncTime;
 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
 		fVSyncRunning = false;
 	} else {
