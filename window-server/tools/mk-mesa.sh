@@ -4,12 +4,17 @@
 # built with the cross compiler of the kernel (xnu-deps/host/bin/xnu-clang, see xnu-deps/setup.sh)
 # against the iOS SDK that userland/build.sh uses; nothing of it is in the repository.
 #
-#   DRIVERS="softpipe"   the gallium drivers to build (softpipe: a rasterizer in plain C; it needs
-#                        no LLVM and nothing of the machine but its processor)
+#   DRIVERS="softpipe,freedreno"
+#                        the gallium drivers to build. softpipe: a rasterizer in plain C; it needs no
+#                        LLVM and nothing of the machine but its processor. freedreno: the Adreno's;
+#                        it talks to the kernel's GPU driver (the service RedwoodGPU) through
+#                        tools/mesa/redwood-drm, which stands in for libdrm (tools/mesa/freedreno-darwin.patch
+#                        makes Mesa build it where there is no DRM). The library takes the GPU when the
+#                        kernel has one and the environment does not say OSMESA_SOFTWARE=1.
 #
 # What comes out, in xnu-deps/build/mesa/out:
 #   libOSMesa.8.dylib    everything in one library (install name /redwood/lib/libOSMesa.8.dylib): the
-#                        OpenGL (ES) entry points gl*, the compiler of the shading language, the driver,
+#                        OpenGL (ES) entry points gl*, the compiler of the shading language, the drivers,
 #                        and the off-screen interface that hands out contexts
 #   exported-gl.txt      the gl* functions it exports, and
 #   gl.xml               their prototypes (the Khronos registry as Mesa has it): for userland/mkeagl.py
@@ -32,6 +37,9 @@ if [ ! -d mesa-$VERSION ]; then
 	tar xJf mesa-$VERSION.tar.xz
 	for p in "$ROOT"/tools/mesa/*.patch; do patch -s -d mesa-$VERSION -p1 < "$p"; done
 fi
+# ours, kept in the repository: always the current ones
+rm -rf mesa-$VERSION/src/redwood-drm
+cp -r "$ROOT/tools/mesa/redwood-drm" mesa-$VERSION/src/redwood-drm
 if [ ! -x venv/bin/python3 ]; then
 	python3 -m venv venv
 	venv/bin/pip -q install mako pyyaml packaging
@@ -59,18 +67,20 @@ endian = 'little'
 [properties]
 needs_exe_wrapper = true
 INI
-[ -f build/build.ninja ] || meson setup build mesa-$VERSION --cross-file cross.ini --prefix=/redwood --libdir=lib \
-	--buildtype=release -Db_ndebug=true \
-	-Dplatforms= -Dgallium-drivers="${DRIVERS:-softpipe}" -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+DRIVERS=${DRIVERS:-softpipe,freedreno}
+BUILD=build-${DRIVERS//,/-}
+[ -f $BUILD/build.ninja ] || meson setup $BUILD mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
+	--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+	-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 	-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
-ninja -C build > ninja.log
+ninja -C $BUILD > ninja.log
 
-llvm-strip -x -o out/libOSMesa.8.dylib build/src/gallium/targets/osmesa/libOSMesa.8.dylib
+llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
 install_name_tool -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
 nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
 cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml out/gl.xml
-echo "mk-mesa.sh: Mesa $VERSION (${DRIVERS:-softpipe}): $B/out/libOSMesa.8.dylib, $(stat -c %s out/libOSMesa.8.dylib) bytes," \
+echo "mk-mesa.sh: Mesa $VERSION ($DRIVERS): $B/out/libOSMesa.8.dylib, $(stat -c %s out/libOSMesa.8.dylib) bytes," \
 	"$(wc -l < out/exported-gl.txt) gl* functions"
