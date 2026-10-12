@@ -53,4 +53,18 @@ int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
 void *redwood_drm_map(int fd, uint32_t handle, uint64_t size);
 void redwood_drm_unmap(int fd, uint32_t handle, void *address);
 
+/*
+ * Not libdrm's either: the memory of an IOSurface as a buffer, in place of the file descriptors
+ * Linux passes such memory around in. The kernel's request and what it answers (struct
+ * redwood_surface in iokit/Kernel/RedwoodGPU.cpp); 0, or -1 with errno.
+ */
+struct redwood_drm_surface {
+	uint32_t surface;                       /* the IOSurface's ID */
+	uint32_t handle;                        /* back: the buffer (the same one each time while it is open), */
+	uint64_t size;                          /* how big it is, */
+	uint32_t offset, row_bytes;             /* where the pixels start in it and how long a row of them is, */
+	uint32_t width, height, pixel_format, planes;   /* and what they are */
+};
+int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
+
 #endif

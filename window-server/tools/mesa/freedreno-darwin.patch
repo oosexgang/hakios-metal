@@ -17,39 +17,6 @@
    pre_args += '-DHAVE_LIBDRM'
    if with_dri_platform == 'drm' and with_dri
      with_gallium_drisw_kms = true
---- a/src/freedreno/meson.build
-+++ b/src/freedreno/meson.build
-@@ -22,7 +22,7 @@
- subdir('ir3')
- subdir('fdl')
- 
--if system_has_kms_drm
-+if system_has_kms_drm or host_machine.system() == 'darwin'
-   subdir('drm')
- endif
- 
---- a/src/freedreno/drm/meson.build
-+++ b/src/freedreno/drm/meson.build
-@@ -45,6 +45,9 @@
-   'msm/msm_ringbuffer_sp.c',
- )
- libfreedreno_drm_files += libfreedreno_drm_msm_files
-+if host_machine.system() == 'darwin'
-+  libfreedreno_drm_files += files('../../redwood-drm/redwood_drm.c')
-+endif
- 
- libfreedreno_drm_virtio_files = files(
-   'virtio/virtio_bo.c',
-@@ -72,8 +75,7 @@
-   c_args : [no_override_init_args, libfreedreno_drm_flags],
-   gnu_symbol_visibility : 'hidden',
-   dependencies : libfreedreno_drm_deps,
--  # TODO
--  link_with : [libvdrm],
-+  link_with : freedreno_kmds.contains('virtio') ? [libvdrm] : [],
-   build_by_default : false,
- )
- 
 --- a/src/freedreno/drm/freedreno_bo.c
 +++ b/src/freedreno/drm/freedreno_bo.c
 @@ -474,7 +474,11 @@
@@ -78,6 +45,28 @@
  }
  
  /* For internal use only, does not check FD_BO_NOMAP: */
+--- a/src/freedreno/drm/meson.build
++++ b/src/freedreno/drm/meson.build
+@@ -45,6 +45,9 @@
+   'msm/msm_ringbuffer_sp.c',
+ )
+ libfreedreno_drm_files += libfreedreno_drm_msm_files
++if host_machine.system() == 'darwin'
++  libfreedreno_drm_files += files('../../redwood-drm/redwood_drm.c')
++endif
+ 
+ libfreedreno_drm_virtio_files = files(
+   'virtio/virtio_bo.c',
+@@ -72,8 +75,7 @@
+   c_args : [no_override_init_args, libfreedreno_drm_flags],
+   gnu_symbol_visibility : 'hidden',
+   dependencies : libfreedreno_drm_deps,
+-  # TODO
+-  link_with : [libvdrm],
++  link_with : freedreno_kmds.contains('virtio') ? [libvdrm] : [],
+   build_by_default : false,
+ )
+ 
 --- a/src/freedreno/ir3/ir3_disk_cache.c
 +++ b/src/freedreno/ir3/ir3_disk_cache.c
 @@ -33,6 +33,10 @@
@@ -99,6 +88,17 @@
  }
  
  void
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -22,7 +22,7 @@
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
 --- a/src/gallium/drivers/freedreno/freedreno_screen.c
 +++ b/src/gallium/drivers/freedreno/freedreno_screen.c
 @@ -25,7 +25,9 @@
@@ -111,6 +111,15 @@
  
  #include "freedreno_fence.h"
  #include "freedreno_perfetto.h"
+@@ -838,7 +840,7 @@
+    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+       bo = fd_bo_from_name(screen->dev, whandle->handle);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+-      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
++      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+       bo = fd_bo_from_dmabuf(screen->dev, whandle->handle);
+    } else {
 @@ -1004,9 +1006,15 @@
     screen->driconf.dual_color_blend_by_location =
           driQueryOptionb(config->options, "dual_color_blend_by_location");
@@ -127,17 +136,85 @@
  
     DBG("Pipe Info:");
     DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -86,6 +86,9 @@
+ extern struct pipe_screen *
+ osmesa_create_screen(void);
+ 
++extern struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++
+ 
+ 
+ struct osmesa_buffer
+@@ -152,6 +155,28 @@
+    }
+ }
+ 
++/*
++ * There is no EGL here. What glEGLImageTargetTexture2DOES is given as an image is the ID of an
++ * IOSurface, whose memory becomes the texture's where the driver can do that (Darwin on redwood).
++ */
++static bool
++osmesa_st_get_egl_image(struct pipe_frontend_screen *fscreen, void *image,
++                        struct st_egl_image *out)
++{
++   out->texture = osmesa_surface_resource(fscreen->screen,
++                                          (uint32_t)(uintptr_t)image);
++   if (!out->texture)
++      return false;
++   out->format = out->texture->format;
++   return true;
++}
++
++static bool
++osmesa_st_validate_egl_image(struct pipe_frontend_screen *fscreen, void *image)
++{
++   return true;
++}
++
+ static void
+ create_st_manager(void)
+ {
+@@ -162,7 +187,8 @@
+    if (global_fscreen) {
+       global_fscreen->screen = osmesa_create_screen();
+       global_fscreen->get_param = osmesa_st_get_param;
+-      global_fscreen->get_egl_image = NULL;
++      global_fscreen->get_egl_image = osmesa_st_get_egl_image;
++      global_fscreen->validate_egl_image = osmesa_st_validate_egl_image;
+    }
+ }
+ 
+Только в b2/src/gallium/frontends/osmesa: osmesa.c.orig
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -39,6 +39,7 @@
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
++    driver_freedreno, idep_xmlconfig, dep_libdrm,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
 --- a/src/gallium/targets/osmesa/osmesa_target.c
 +++ b/src/gallium/targets/osmesa/osmesa_target.c
-@@ -26,6 +26,39 @@
+@@ -26,6 +26,87 @@
  
  #include "sw/null/null_sw_winsys.h"
  
++#include "frontend/winsys_handle.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++
 +#ifdef GALLIUM_FREEDRENO
 +#include "freedreno/drm/freedreno_drm_public.h"
 +#include "util/driconf.h"
 +#include "util/xmlconfig.h"
 +#include <xf86drm.h>
++
++static int gpu_fd = -1;
 +
 +static const driOptionDescription freedreno_options[] = {
 +#include "freedreno/driinfo_freedreno.h"
@@ -162,14 +239,56 @@
 +   config.options = &cache;
 +   config.options_info = &info;
 +   screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
++   if (screen)
++      gpu_fd = fd;
 +   return screen ? debug_screen_wrap(screen) : NULL;
 +}
 +#endif
 +
++
++struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++
++/*
++ * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on redwood):
++ * the kernel's GPU driver makes a buffer of the surface. NULL: the screen is not the GPU's, or
++ * the surface is not one plane of 32-bit pixels, blue first, in rows the GPU can address.
++ */
++struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
++{
++#ifdef GALLIUM_FREEDRENO
++   struct redwood_drm_surface s = { .surface = surface };
++   struct pipe_resource templ = {
++      .target = PIPE_TEXTURE_2D,
++      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
++      .depth0 = 1,
++      .array_size = 1,
++      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
++   };
++   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_KMS };
++
++   if (gpu_fd < 0 || redwood_drm_surface(gpu_fd, &s) != 0)
++      return NULL;
++   /* (a buffer that is refused stays the kernel's until the surface is asked for again, or for good) */
++   if (s.pixel_format != 0x42475241 /* 'BGRA' */ || s.planes != 0)
++      return NULL;
++   templ.width0 = s.width;
++   templ.height0 = s.height;
++   handle.handle = s.handle;
++   handle.stride = s.row_bytes;
++   handle.offset = s.offset;
++   handle.size = s.size;
++   return screen->resource_from_handle(screen, &templ, &handle, 0);
++#else
++   return NULL;
++#endif
++}
++
  
  struct pipe_screen *
  osmesa_create_screen(void);
-@@ -37,6 +70,12 @@
+@@ -37,6 +118,12 @@
     struct sw_winsys *winsys;
     struct pipe_screen *screen;
  
@@ -182,13 +301,3 @@
     /* We use a null software winsys since we always just render to ordinary
      * driver resources.
      */
---- a/src/gallium/targets/osmesa/meson.build
-+++ b/src/gallium/targets/osmesa/meson.build
-@@ -39,6 +39,7 @@
-   ],
-   dependencies : [
-     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
-+    driver_freedreno, idep_xmlconfig, dep_libdrm,
-   ],
-   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
-   soversion : host_machine.system() == 'windows' ? '' : '8',

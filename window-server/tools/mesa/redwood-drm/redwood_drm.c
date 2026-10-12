@@ -17,6 +17,7 @@
 #include "xf86drm.h"
 
 #define REDWOOD_GPU_SERVICE     "RedwoodGPU"
+#define REDWOOD_GPU_SURFACE     0x7e            /* the request that is not Linux's */
 
 static io_connect_t connection;
 static int connection_fd = -1;
@@ -152,10 +153,8 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 	(void)size;
 	/*
 	 * Linux gives freedreno its buffers write-combined, with no cache of this processor's between
-	 * the program and the memory the GPU sees. This kernel cannot change how a buffer's pages are
-	 * cached once they are there (it panics in pmap_set_cache_attributes), so the mapping is an
-	 * ordinary one and the kernel's driver empties the cache of every buffer of a submission
-	 * as it takes the submission.
+	 * the program and the memory the GPU sees. So does the kernel's driver here: the memory is
+	 * made that way, and this mapping is as the memory is.
 	 */
 	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
@@ -168,6 +167,19 @@ redwood_drm_unmap(int fd, uint32_t handle, void *address)
 {
 	(void)fd;
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
+}
+
+int
+redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
+{
+	int error = call(REDWOOD_GPU_SURFACE, surface, sizeof(*surface));
+
+	(void)fd;
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	return 0;
 }
 
 static int

@@ -35,7 +35,7 @@ if [ ! -d mesa-$VERSION ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	tar xJf mesa-$VERSION.tar.xz
-	for p in "$ROOT"/tools/mesa/*.patch; do patch -s -d mesa-$VERSION -p1 < "$p"; done
+	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
 fi
 # ours, kept in the repository: always the current ones
 rm -rf mesa-$VERSION/src/redwood-drm
