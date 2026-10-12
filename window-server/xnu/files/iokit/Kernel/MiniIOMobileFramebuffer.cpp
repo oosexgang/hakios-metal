@@ -94,6 +94,15 @@ static uint8_t  gFBCalls[128];          /* how many calls of each selector were 
 
 static TUNABLE(uint32_t, gFBWidth, "fbwidth", kFBDefaultWidth);
 static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
+/*
+ * Boot-arg fbscale=2: the same 375 x 812 points drawn at two pixels a point instead of three.
+ * Everything that is drawn is drawn by the processor, and this is 2.25 times fewer pixels to
+ * draw; the picture is then enlarged to the panel and is that much less sharp.
+ */
+#define kFBPointsWide           375
+#define kFBPointsHigh           812
+#define kFBDefaultScale         3
+static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
 static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
 
@@ -258,6 +267,22 @@ IOMobileFramebuffer::start(IOService * provider)
 	fRowBytes = vinfo.v_rowbytes;
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
+	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
+		static const char * const places[][2] = { { "/chosen", "display-scale" }, { "/product", "artwork-scale-factor" } };
+		uint32_t scale = gFBScale;
+
+		fWidth = kFBPointsWide * scale;
+		fHeight = kFBPointsHigh * scale;
+		/* what the loader's device tree says about the scale is where MobileGestalt has it from */
+		for (unsigned i = 0; i < sizeof(places) / sizeof(places[0]); i++) {
+			IORegistryEntry * node = IORegistryEntry::fromPath(places[i][0], gIODTPlane);
+
+			if (node != NULL) {
+				node->setProperty(places[i][1], &scale, sizeof(scale));
+				node->release();
+			}
+		}
+	}
 	fColumn = IONewZero(uint32_t, fPanelWidth);
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
@@ -693,7 +718,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		if (args->scalarOutputCount < 1) {
 			return kIOReturnBadArgument;
 		}
-		out[0] = kFBDotsPerInch;
+		out[0] = kFBDotsPerInch * fOwner->fWidth / kFBDefaultWidth;
 		args->scalarOutputCount = 1;
 		return kIOReturnSuccess;
 
