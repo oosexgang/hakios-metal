@@ -1,0 +1,194 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1716,7 +1716,15 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if dep_libdrm.found()
++if host_machine.system() == 'darwin' and with_gallium_freedreno
++  # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
++  # for libdrm (src/redwood-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
++  # source file is built with freedreno's drm layer, src/freedreno/drm).
++  dep_libdrm = declare_dependency(
++    include_directories : include_directories('src/redwood-drm'),
++    link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
++  )
++elif dep_libdrm.found()
+   pre_args += '-DHAVE_LIBDRM'
+   if with_dri_platform == 'drm' and with_dri
+     with_gallium_drisw_kms = true
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -22,7 +22,7 @@
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
+--- a/src/freedreno/drm/meson.build
++++ b/src/freedreno/drm/meson.build
+@@ -45,6 +45,9 @@
+   'msm/msm_ringbuffer_sp.c',
+ )
+ libfreedreno_drm_files += libfreedreno_drm_msm_files
++if host_machine.system() == 'darwin'
++  libfreedreno_drm_files += files('../../redwood-drm/redwood_drm.c')
++endif
+ 
+ libfreedreno_drm_virtio_files = files(
+   'virtio/virtio_bo.c',
+@@ -72,8 +75,7 @@
+   c_args : [no_override_init_args, libfreedreno_drm_flags],
+   gnu_symbol_visibility : 'hidden',
+   dependencies : libfreedreno_drm_deps,
+-  # TODO
+-  link_with : [libvdrm],
++  link_with : freedreno_kmds.contains('virtio') ? [libvdrm] : [],
+   build_by_default : false,
+ )
+ 
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -474,7 +474,11 @@
+    fd_bo_fini_fences(bo);
+ 
+    if (bo->map)
++#ifdef __APPLE__
++      redwood_drm_unmap(bo->dev->fd, bo->handle, bo->map);
++#else
+       os_munmap(bo->map, bo->size);
++#endif
+ 
+    if (handle) {
+       simple_mtx_lock(&table_lock);
+@@ -618,8 +622,13 @@
+    if (ret) {
+       return NULL;
+    }
++#ifdef __APPLE__
++   /* no mmap() on a device here: the kernel's driver maps the buffer (src/redwood-drm) */
++   return redwood_drm_map(bo->dev->fd, bo->handle, bo->size);
++#else
+    return os_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   bo->dev->fd, offset);
++#endif
+ }
+ 
+ /* For internal use only, does not check FD_BO_NOMAP: */
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -33,6 +33,10 @@
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
++#ifdef __APPLE__
++   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */
++   return;
++#else
+    const char *renderer = fd_dev_name(compiler->dev_id);
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+@@ -46,6 +50,7 @@
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#endif
+ }
+ 
+ void
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -25,7 +25,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "drm-uapi/drm_fourcc.h"
++#ifndef __APPLE__
+ #include <sys/sysinfo.h>
++#endif
+ 
+ #include "freedreno_fence.h"
+ #include "freedreno_perfetto.h"
+@@ -1004,9 +1006,15 @@
+    screen->driconf.dual_color_blend_by_location =
+          driQueryOptionb(config->options, "dual_color_blend_by_location");
+ 
++#ifdef __APPLE__
++   uint64_t memory = 0;
++   os_get_total_physical_memory(&memory);
++   screen->ram_size = memory > UINT32_MAX ? UINT32_MAX : memory;
++#else
+    struct sysinfo si;
+    sysinfo(&si);
+    screen->ram_size = si.totalram;
++#endif
+ 
+    DBG("Pipe Info:");
+    DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -26,6 +26,39 @@
+ 
+ #include "sw/null/null_sw_winsys.h"
+ 
++#ifdef GALLIUM_FREEDRENO
++#include "freedreno/drm/freedreno_drm_public.h"
++#include "util/driconf.h"
++#include "util/xmlconfig.h"
++#include <xf86drm.h>
++
++static const driOptionDescription freedreno_options[] = {
++#include "freedreno/driinfo_freedreno.h"
++};
++
++/* The GPU's driver, where the kernel has a GPU to drive (Darwin on redwood); NULL: none. */
++static struct pipe_screen *
++osmesa_create_gpu_screen(void)
++{
++   static driOptionCache info, cache;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   int fd;
++
++   if (debug_get_bool_option("OSMESA_SOFTWARE", false))
++      return NULL;
++   fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
++   if (fd < 0)
++      return NULL;
++   driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
++   driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
++   config.options = &cache;
++   config.options_info = &info;
++   screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
++   return screen ? debug_screen_wrap(screen) : NULL;
++}
++#endif
++
+ 
+ struct pipe_screen *
+ osmesa_create_screen(void);
+@@ -37,6 +70,12 @@
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
++#ifdef GALLIUM_FREEDRENO
++   screen = osmesa_create_gpu_screen();
++   if (screen)
++      return screen;
++#endif
++
+    /* We use a null software winsys since we always just render to ordinary
+     * driver resources.
+     */
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -39,6 +39,7 @@
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
++    driver_freedreno, idep_xmlconfig, dep_libdrm,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
