@@ -889,6 +889,25 @@ publishAccelerator(IOService * provider)
 	OSSafeReleaseNULL(accelerator);
 }
 
+/*
+ * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
+ * the top left corner of the panel as they are and cut to its size.
+ */
+extern "C" void
+MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes)
+{
+	uint32_t columns = width < vinfo.v_width ? width : (uint32_t) vinfo.v_width;
+	uint32_t rows = height < vinfo.v_height ? height : (uint32_t) vinfo.v_height;
+
+	if (vinfo.v_baseaddr == 0 || vinfo.v_depth != 32) {
+		return;
+	}
+	for (uint32_t y = 0; y < rows; y++) {
+		memcpy((void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), pixels + (size_t) y * rowBytes,
+		    (size_t) columns * 4);
+	}
+}
+
 void
 MiniIOMobileFramebufferStart(IOService * provider)
 {
