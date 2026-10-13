@@ -22,6 +22,7 @@
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
@@ -77,6 +78,8 @@ enum {
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
+#define SWAP_GPU_MS             500                     /* a frame the GPU has not drawn by then is shown as it is */
+#define SWAP_HELD_MS            700                     /* a swap that cannot be taken by then is not shown at all */
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
 
@@ -125,6 +128,7 @@ static TUNABLE(uint32_t, gRecStart, "rec_start", 0);
 static TUNABLE(uint32_t, gRecMegabytes, "rec_mb", 480);
 static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
+static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 
 static inline uint32_t
 refreshHz(void)
@@ -170,6 +174,39 @@ public:
 	uint32_t        fSwapsShown;
 	uint32_t        fLayersShown;           /* which layers the last swap had a surface in */
 	bool            fGraphics;              /* the text console has been told to stop */
+	/*
+	 * A frame goes to the panel when the GPU is done with it: a thread of ours waits for that
+	 * and copies it there, and whoever made the frame is back at the next one meanwhile. One
+	 * frame waits at a time: the swap after it is held, in SwapEnd, until this one is being
+	 * copied to the panel. Whoever draws is so at most two frames ahead of the panel, and
+	 * needs a third surface to be that: CoreAnimation makes itself a new one for every frame.
+	 */
+	IOLock *        fSwapLock;              /* around the next five */
+	uint8_t         fSwap[SWAP_SIZE];       /* the swap that is on its way to the panel */
+	MiniIOSurface * fSwapSurfaces[SWAP_LAYERS];     /* ... its surfaces, held from SwapEnd on: their maker may let go of them */
+	bool            fSwapThere;
+	/*
+	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
+	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
+	 * each took to draw, as long as there is one for every beat. The beat is this driver's own.
+	 * (CoreAnimation does not go by the refresh notifications of this driver -- it never asks
+	 * for them -- but by a clock of its own at the rate it reads here; and where the panel's
+	 * scan is nobody can read: the display block's register clock is off.) It starts with a
+	 * frame that comes later than a beat and a half after the one before -- the first after a
+	 * pause, or every one of a renderer that does not keep up, the software one: such a frame
+	 * is shown at once, a beat would only make it later still -- and gives way by an eighth of
+	 * what a frame is early or late, so that frames are ready some six milliseconds before
+	 * their beat: neither a slow one nor a quick one then lands on the wrong side of it.
+	 */
+	uint64_t        fBeat;                  /* the beat the last frame was shown on */
+	uint64_t        fReady;                 /* when the last frame was ready to be shown */
+	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
+	uint64_t        fStatBeatWait;
+	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
+	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
+	uint64_t        fSwapTime;              /* when the last swap was handed over */
+	uint32_t        fStatSwapsLate;         /* swaps that came more than a refresh and a quarter after the one before (and no pause) */
+	uint64_t        fStatWaiting;           /* how long frames waited for the GPU here */
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
 	uint64_t        fStatSince, fStatDrawing;
@@ -191,6 +228,9 @@ public:
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
+	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void presenter(void);
+	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void record(MiniIOSurface * s);
@@ -272,6 +312,8 @@ IOMobileFramebuffer::publishModes(void)
 bool
 IOMobileFramebuffer::start(IOService * provider)
 {
+	thread_t thread;
+
 	if (!IOService::start(provider)) {
 		return false;
 	}
@@ -281,6 +323,13 @@ IOMobileFramebuffer::start(IOService * provider)
 		return false;
 	}
 	fLock = IOLockAlloc();
+	fSwapLock = IOLockAlloc();
+	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
+		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
+		return false;
+	}
+	thread_set_thread_name(thread, "frames to the panel");
+	thread_deallocate(thread);
 	fBase = (uint8_t *) vinfo.v_baseaddr;
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
@@ -335,6 +384,8 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
+	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
 	publishModes();
 	setName("disp0");
 	registerService();
@@ -509,14 +560,116 @@ IOMobileFramebuffer::reportFrameTimes(void)
 	fFramePauses = fFrameLongest = 0;
 }
 
+/* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has no other waiting. */
 void
 IOMobileFramebuffer::present(const uint8_t * swap)
+{
+	AbsoluteTime deadline;
+
+	uint64_t now = mach_absolute_time(), period, pause;
+
+	/* (a frame that is late on the panel was late here already, or it was not: for telling whose it is) */
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
+	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
+	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
+	IOLockLock(fSwapLock);
+	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
+	fSwapTime = now;
+	fStatHeld += fSwapThere;
+	while (fSwapThere) {
+		if (IOLockSleepDeadline(fSwapLock, &fSwapThere, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && fSwapThere) {
+			fStatLost++;                    /* (the GPU has stopped answering: the frame before is waiting for it) */
+			IOLockUnlock(fSwapLock);
+			return;
+		}
+	}
+	memcpy(fSwap, swap, SWAP_SIZE);
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+
+		fSwapSurfaces[layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+	}
+	fSwapThere = true;
+	IOLockWakeup(fSwapLock, fSwap, true);
+	IOLockUnlock(fSwapLock);
+}
+
+void
+IOMobileFramebuffer::presenterMain(void * self, wait_result_t result __unused)
+{
+	((IOMobileFramebuffer *) self)->presenter();
+}
+
+void
+IOMobileFramebuffer::presenter(void)
+{
+	static uint8_t swap[SWAP_SIZE];         /* (one thread) */
+	MiniIOSurface * surfaces[SWAP_LAYERS];
+
+	for (;;) {
+		IOLockLock(fSwapLock);
+		while (!fSwapThere) {
+			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+		}
+		memcpy(swap, fSwap, SWAP_SIZE);
+		memcpy(surfaces, fSwapSurfaces, sizeof(surfaces));
+		IOLockUnlock(fSwapLock);
+		show(swap, surfaces);
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (surfaces[layer] != NULL) {
+				MiniIOSurfaceDrop(surfaces[layer]);
+			}
+		}
+		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
+	}
+}
+
+/* A swap's surfaces onto the panel, once the GPU is done with them. */
+void
+IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos;
 	uint32_t layers = 0;
 	bool report;
 
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
+			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+		}
+	}
+	fStatWaiting += mach_absolute_time() - began;
+	began = mach_absolute_time();
+	if (gOnTheBeat) {
+		uint64_t period, aim, next;
+
+		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+		aim = period * 3 / 8;
+		next = fReady;
+		fReady = began;
+		if (fBeat == 0 || began - next > period * 3 / 2) {
+			fBeat = began;
+		} else {
+			for (next = fBeat + period; next < began; next += period) {
+			}
+			if (next - began > aim) {
+				next -= (next - began - aim) / 8;
+			} else {
+				next += (aim - (next - began)) / 8;
+			}
+			clock_delay_until(next);
+			fBeat = next;
+			fStatOnBeat++;
+			fStatBeatWait += mach_absolute_time() - began;
+			began = mach_absolute_time();
+		}
+	}
+	/* its turn has come: the swap after it may be handed over */
+	IOLockLock(fSwapLock);
+	fSwapThere = false;
+	IOLockWakeup(fSwapLock, &fSwapThere, true);
+	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
@@ -541,6 +694,13 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		MiniIOSurface * s;
 
 		layers |= sid != 0 ? 1u << layer : 0;
+		/* the frames' surfaces: is it a few, in turn? */
+		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
+			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
+				fStatSurfaces[i] = sid;
+				break;
+			}
+		}
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
 			if (layer == 0 && (set & 1) && fGraphics) {
@@ -552,7 +712,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		}
 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
-		s = MiniIOSurfaceCopy(sid);
+		s = surfaces[layer];
 		if (report) {
 			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
 			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
@@ -575,7 +735,6 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 				record(s);
 			}
 		}
-		MiniIOSurfaceDrop(s);
 	}
 	fSwapsShown++;
 	if (layers != fLayersShown) {
@@ -593,11 +752,35 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - fStatSince, &nanos);
 	if (nanos >= 5 * NSEC_PER_SEC) {
-		uint64_t drawing;
+		uint64_t drawing, waiting, beat;
+		unsigned different;
 
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
-		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver\n", fStatFrames,
-		    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC);
+		absolutetime_to_nanoseconds(fStatWaiting, &waiting);
+		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
+		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
+		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
+		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
+		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
+		    fStatHeld, fStatLost, fStatSwapsLate);
+		fStatSwapsLate = 0;
+		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
+		}
+		if (different == 8 && fStatFrames > 8) {
+			uint32_t made, freed, again;
+			uint64_t making, freeing;
+
+			/* (CoreAnimation has made itself a new surface for every frame: see "the frames' surfaces" above) */
+			MiniIOSurfaceCost(&made, &making, &freed, &freeing, &again);
+			IOLog("MiniIOMobileFramebuffer: the frames came in surfaces %u, %u, %u, %u, %u and on, none twice; in that time "
+			    "%u surfaces of all kinds were made, in %llu us each (%u of them of memory kept from one before), and %u "
+			    "freed, in %llu us each\n", fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
+			    fStatSurfaces[4], made, making, again, freed, freeing);
+		}
+		bzero(fStatSurfaces, sizeof(fStatSurfaces));
+		fStatHeld = fStatLost = fStatOnBeat = 0;
+		fStatWaiting = fStatBeatWait = 0;
 		reportFrameTimes();
 		if (fDiff) {
 			IOLog("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
