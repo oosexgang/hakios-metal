@@ -31,11 +31,17 @@ CC=$ROOT/xnu-deps/host/bin/xnu-clang
 mkdir -p "$B/out"
 cd "$B"
 
-if [ ! -d mesa-$VERSION ]; then
+# The sources are the archive's with tools/mesa/*.patch on top. When the patches change, a tree that was
+# patched with the earlier ones is of no use (and builds without a word into a library that does not match
+# the rest): the sources are taken from the archive again and everything is built anew, about a minute.
+PATCHES=$(cat "$ROOT"/tools/mesa/*.patch | sha256sum | cut -d' ' -f1)
+if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
+	rm -rf mesa-$VERSION build-*
 	tar xJf mesa-$VERSION.tar.xz
 	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
+	echo "$PATCHES" > mesa-$VERSION/.redwood-patches
 fi
 # ours, kept in the repository: always the current ones
 rm -rf mesa-$VERSION/src/redwood-drm
