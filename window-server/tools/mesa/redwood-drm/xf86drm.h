@@ -38,9 +38,13 @@ drmVersionPtr drmGetVersion(int fd);
 void drmFreeVersion(drmVersionPtr version);
 int drmGetCap(int fd, uint64_t capability, uint64_t *value);
 
-/* buffers and fences as file descriptors: there are none here */
+/*
+ * Buffers and fences as file descriptors: there are none here. But memory that somebody else
+ * has made does come in, as Linux's comes in by file descriptor: an IOSurface, by its ID, where
+ * freedreno expects the descriptor (see redwood_drm_surface() below).
+ */
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
-int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
+int drmPrimeFDToHandle(int fd, int surface, uint32_t *handle);
 int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
 int drmSyncobjDestroy(int fd, uint32_t handle);
 int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count);
@@ -54,14 +58,16 @@ void *redwood_drm_map(int fd, uint32_t handle, uint64_t size);
 void redwood_drm_unmap(int fd, uint32_t handle, void *address);
 
 /*
- * Not libdrm's either: the memory of an IOSurface as a buffer, in place of the file descriptors
- * Linux passes such memory around in. The kernel's request and what it answers (struct
- * redwood_surface in iokit/Kernel/RedwoodGPU.cpp); 0, or -1 with errno.
+ * Not libdrm's either: what the memory of an IOSurface would be like as a buffer (the kernel's
+ * request and its answer: struct redwood_surface in iokit/Kernel/RedwoodGPU.cpp); 0, or -1 with
+ * errno. The buffer itself is made by drmPrimeFDToHandle(), which freedreno calls with its
+ * table of buffers locked, so that a buffer on its way out and the same surface on its way in
+ * cannot pass each other.
  */
 struct redwood_drm_surface {
 	uint32_t surface;                       /* the IOSurface's ID */
-	uint32_t handle;                        /* back: the buffer (the same one each time while it is open), */
-	uint64_t size;                          /* how big it is, */
+	uint32_t handle;                        /* (the kernel's: which of the two is asked) */
+	uint64_t size;                          /* back: how big the buffer is, */
 	uint32_t offset, row_bytes;             /* where the pixels start in it and how long a row of them is, */
 	uint32_t width, height, pixel_format, planes;   /* and what they are */
 };

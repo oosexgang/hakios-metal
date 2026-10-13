@@ -19,7 +19,23 @@
      with_gallium_drisw_kms = true
 --- a/src/freedreno/drm/freedreno_bo.c
 +++ b/src/freedreno/drm/freedreno_bo.c
-@@ -474,7 +474,11 @@
+@@ -245,9 +245,15 @@
+    if (bo)
+       goto out_unlock;
+ 
++#ifdef __APPLE__
++   /* (what comes in here is an IOSurface, and the "file descriptor" its ID) */
++   struct redwood_drm_surface surface = { .surface = fd };
++   size = redwood_drm_surface(dev->fd, &surface) ? 0 : surface.size;
++#else
+    /* lseek() to get bo size */
+    size = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_CUR);
++#endif
+ 
+    bo = import_bo_from_handle(dev, size, handle);
+ 
+@@ -474,7 +480,11 @@
     fd_bo_fini_fences(bo);
  
     if (bo->map)
@@ -31,7 +47,7 @@
  
     if (handle) {
        simple_mtx_lock(&table_lock);
-@@ -618,8 +622,13 @@
+@@ -618,8 +628,13 @@
     if (ret) {
        return NULL;
     }
@@ -67,6 +83,25 @@
    build_by_default : false,
  )
  
+--- a/src/freedreno/drm/msm/msm_priv.h
++++ b/src/freedreno/drm/msm/msm_priv.h
+@@ -176,7 +176,16 @@
+    if (ns == OS_TIMEOUT_INFINITE)
+       ns = 3600ULL * NSEC_PER_SEC; /* 1 hour timeout is almost infinite */
+ 
++#ifdef __APPLE__
++   /* The kernel's driver goes by the clock that runs on while the machine sleeps,
++    * mach_continuous_time(), which is this one. CLOCK_MONOTONIC is another on Darwin: the
++    * date less the date the system says it was started at. Where the two are not the
++    * same, a time made of the one is long past by the other, and nothing is waited for.
++    */
++   clock_gettime(CLOCK_MONOTONIC_RAW, &t);
++#else
+    clock_gettime(CLOCK_MONOTONIC, &t);
++#endif
+    tv->tv_sec = t.tv_sec + ns / NSEC_PER_SEC;
+    tv->tv_nsec = t.tv_nsec + ns % NSEC_PER_SEC;
+    if (tv->tv_nsec >= NSEC_PER_SEC) { /* handle nsec overflow */
 --- a/src/freedreno/ir3/ir3_disk_cache.c
 +++ b/src/freedreno/ir3/ir3_disk_cache.c
 @@ -33,6 +33,10 @@
@@ -111,15 +146,6 @@
  
  #include "freedreno_fence.h"
  #include "freedreno_perfetto.h"
-@@ -838,7 +840,7 @@
-    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
-       bo = fd_bo_from_name(screen->dev, whandle->handle);
-    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
--      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
-+      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);
-    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
-       bo = fd_bo_from_dmabuf(screen->dev, whandle->handle);
-    } else {
 @@ -1004,9 +1006,15 @@
     screen->driconf.dual_color_blend_by_location =
           driQueryOptionb(config->options, "dual_color_blend_by_location");
@@ -266,16 +292,16 @@
 +      .array_size = 1,
 +      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
 +   };
-+   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_KMS };
++   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD };
 +
 +   if (gpu_fd < 0 || redwood_drm_surface(gpu_fd, &s) != 0)
 +      return NULL;
-+   /* (a buffer that is refused stays the kernel's until the surface is asked for again, or for good) */
 +   if (s.pixel_format != 0x42475241 /* 'BGRA' */ || s.planes != 0)
 +      return NULL;
++   /* (the surface comes in as Linux's buffers come in by file descriptor: see redwood-drm) */
 +   templ.width0 = s.width;
 +   templ.height0 = s.height;
-+   handle.handle = s.handle;
++   handle.handle = surface;
 +   handle.stride = s.row_bytes;
 +   handle.offset = s.offset;
 +   handle.size = s.size;

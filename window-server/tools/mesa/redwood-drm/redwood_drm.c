@@ -18,6 +18,7 @@
 
 #define REDWOOD_GPU_SERVICE     "RedwoodGPU"
 #define REDWOOD_GPU_SURFACE     0x7e            /* the request that is not Linux's */
+#define REDWOOD_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 
 static io_connect_t connection;
 static int connection_fd = -1;
@@ -172,13 +173,30 @@ redwood_drm_unmap(int fd, uint32_t handle, void *address)
 int
 redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
 {
-	int error = call(REDWOOD_GPU_SURFACE, surface, sizeof(*surface));
+	int error;
+
+	(void)fd;
+	surface->handle = REDWOOD_GPU_DESCRIBE;
+	error = call(REDWOOD_GPU_SURFACE, surface, sizeof(*surface));
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	return 0;
+}
+
+int
+drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
+{
+	struct redwood_drm_surface request = { .surface = (uint32_t)surface };
+	int error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
 
 	(void)fd;
 	if (error != 0) {
 		errno = error;
 		return -1;
 	}
+	*handle = request.handle;
 	return 0;
 }
 
@@ -193,8 +211,6 @@ none(void)
 #define NONE(name, ...) int name(__VA_ARGS__) { return none(); }
 NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
     __attribute__((unused)) uint32_t flags, __attribute__((unused)) int *prime_fd)
-NONE(drmPrimeFDToHandle, __attribute__((unused)) int fd, __attribute__((unused)) int prime_fd,
-    __attribute__((unused)) uint32_t *handle)
 NONE(drmSyncobjCreate, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t flags,
     __attribute__((unused)) uint32_t *handle)
 NONE(drmSyncobjDestroy, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle)
