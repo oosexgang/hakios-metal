@@ -88,5 +88,7 @@ llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMe
 install_name_tool -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
 nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
 cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml out/gl.xml
+# (userland/build.sh comes here again when this no longer matches)
+cat "$ROOT"/tools/mesa/*.patch "$ROOT"/tools/mesa/redwood-drm/* | sha256sum > out/built-from
 echo "mk-mesa.sh: Mesa $VERSION ($DRIVERS): $B/out/libOSMesa.8.dylib, $(stat -c %s out/libOSMesa.8.dylib) bytes," \
 	"$(wc -l < out/exported-gl.txt) gl* functions"

@@ -134,6 +134,42 @@
    subdir('drm')
  endif
  
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -445,6 +445,21 @@
+        DRAW == DRAW_INDIRECT_OP_INDIRECT_COUNT)
+       ctx->batch->barrier |= FD6_WAIT_FOR_ME;
+ 
++   /* Darwin on redwood: a draw that reads the framebuffer reads it through
++    * UCHE.  Among primitives drawn with FLUSH_PER_OVERLAP the hardware sees
++    * to it that they read what the ones before them wrote, but it knows
++    * nothing of what was drawn before that mode was on: the first triangle
++    * to read the framebuffer after a draw that did not, read (with GMEM)
++    * pixels of another tile.  Seen on a642l with CoreAnimation, which draws
++    * a label's shadow that way over icons drawn the ordinary way: the first
++    * triangle of each such quad was wrong, the second right.  A CCU colour
++    * flush before the draw mends it, and so does a UCHE invalidate alone;
++    * the first such draw gets both, as a framebuffer barrier would give.
++    */
++   if (unlikely(emit.fs->fb_read) && !ctx->batch->prev_draw_read_fb)
++      ctx->batch->barrier |= FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE;
++   ctx->batch->prev_draw_read_fb = emit.fs->fb_read;
++
+    if (ctx->batch->barrier)
+       fd6_barrier_flush<CHIP>(ctx->batch);
+ 
+--- a/src/gallium/drivers/freedreno/freedreno_batch.h
++++ b/src/gallium/drivers/freedreno/freedreno_batch.h
+@@ -136,6 +136,9 @@
+    /* Driver specific barrier/flush flags: */
+    unsigned barrier;
+ 
++   /* The last draw emitted read the framebuffer (see fd6_draw.cc): */
++   bool prev_draw_read_fb;
++
+    /* A calculated "draw cost" value for the batch, which tries to
+     * estimate the bandwidth-per-sample of all the draws according
+     * to:
 --- a/src/gallium/drivers/freedreno/freedreno_screen.c
 +++ b/src/gallium/drivers/freedreno/freedreno_screen.c
 @@ -25,7 +25,9 @@
