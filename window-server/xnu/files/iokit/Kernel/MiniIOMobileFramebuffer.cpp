@@ -159,6 +159,13 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+#define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+static TUNABLE(uint32_t, gQueue, "fb_queue", 1);
+static inline unsigned
+swapQueue(void)
+{
+	return gQueue >= 1 && gQueue <= SWAP_QUEUE ? gQueue : 1;
+}
 /*
  * Boot-arg touch_lat=1: a line for every swap handed over ("tl: s ID at US") and for every frame
  * put on the panel ("tl: v ID ready US shown US done US": the GPU done with it, its beat come, the
@@ -234,11 +241,13 @@ public:
 	 * frame waits at a time: the swap after it is held, in SwapEnd, until this one is being
 	 * copied to the panel. Whoever draws is so at most two frames ahead of the panel, and
 	 * needs a third surface to be that: CoreAnimation makes itself a new one for every frame.
+	 * Boot-arg fb_queue=2: two frames may wait. (CoreAnimation draws on a clock of its own; a
+	 * SwapEnd held past its next tick makes that tick late, and the clock goes on from there.)
 	 */
 	IOLock *        fSwapLock;              /* around the next five */
-	uint8_t         fSwap[SWAP_SIZE];       /* the swap that is on its way to the panel */
-	MiniIOSurface * fSwapSurfaces[SWAP_LAYERS];     /* ... its surfaces, held from SwapEnd on: their maker may let go of them */
-	bool            fSwapThere;
+	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
+	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
+	unsigned        fSwapFirst, fSwapsWaiting;
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -862,21 +871,24 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
 	fSwapTime = now;
-	fStatHeld += fSwapThere;
-	while (fSwapThere) {
-		if (IOLockSleepDeadline(fSwapLock, &fSwapThere, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && fSwapThere) {
+	fStatHeld += fSwapsWaiting >= swapQueue();
+	while (fSwapsWaiting >= swapQueue()) {
+		if (IOLockSleepDeadline(fSwapLock, &fSwapsWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+		    fSwapsWaiting >= swapQueue()) {
 			fStatLost++;                    /* (the GPU has stopped answering: the frame before is waiting for it) */
 			IOLockUnlock(fSwapLock);
 			return;
 		}
 	}
-	memcpy(fSwap, swap, SWAP_SIZE);
+	unsigned slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
+
+	memcpy(fSwap[slot], swap, SWAP_SIZE);
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 
-		fSwapSurfaces[layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
 	}
-	fSwapThere = true;
+	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
 	IOLockUnlock(fSwapLock);
 }
@@ -895,11 +907,11 @@ IOMobileFramebuffer::presenter(void)
 
 	for (;;) {
 		IOLockLock(fSwapLock);
-		while (!fSwapThere) {
+		while (fSwapsWaiting == 0) {
 			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
 		}
-		memcpy(swap, fSwap, SWAP_SIZE);
-		memcpy(surfaces, fSwapSurfaces, sizeof(surfaces));
+		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
+		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
 		IOLockUnlock(fSwapLock);
 		show(swap, surfaces);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
@@ -956,8 +968,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	shown = began;
 	/* its turn has come: the swap after it may be handed over */
 	IOLockLock(fSwapLock);
-	fSwapThere = false;
-	IOLockWakeup(fSwapLock, &fSwapThere, true);
+	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+	fSwapsWaiting--;
+	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
