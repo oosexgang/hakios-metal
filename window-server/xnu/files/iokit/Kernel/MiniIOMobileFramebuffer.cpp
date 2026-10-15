@@ -151,6 +151,28 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
 static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
+/*
+ * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
+ * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
+ * to 10 (the phone, 15 October; fb_threads=1 is how it was).
+ */
+static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+/*
+ * Boot-arg touch_lat=1: a line for every swap handed over ("tl: s ID at US") and for every frame
+ * put on the panel ("tl: v ID ready US shown US done US": the GPU done with it, its beat come, the
+ * pixels in the panel's memory), in microseconds of mach_absolute_time, for measuring how long a
+ * touch takes to show (tools/latency.py; the touch's own lines: bsd/dev/redwood_input.c).
+ */
+static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
+
+static inline uint64_t
+micros(uint64_t absolute)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns / 1000;
+}
 
 static inline uint32_t
 refreshHz(void)
@@ -187,6 +209,8 @@ swapWord(const uint8_t * swap, unsigned offset)
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+struct RowJob;
 
 class IOMobileFramebuffer : public IOService
 {
@@ -265,6 +289,15 @@ public:
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	static void helperMain(void * self, wait_result_t result);
+	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
+	unsigned        fThreads;
+	IOLock *        fHelperLock;
+	const struct RowJob * fHelperJob;
+	uint64_t        fHelperGeneration;
+	unsigned        fHelpersBusy, fHelpersStarted;
+	uint32_t *      fHelperBlend[7];
 	void record(MiniIOSurface * s);
 };
 
@@ -362,6 +395,16 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	thread_set_thread_name(thread, "frames to the panel");
 	thread_deallocate(thread);
+	fThreads = gThreads >= 1 && gThreads <= 8 ? gThreads : 1;
+	fHelperLock = IOLockAlloc();
+	for (unsigned i = 0; i + 1 < fThreads; i++) {
+		if (kernel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
+			fThreads = i + 1;
+			break;
+		}
+		thread_set_thread_name(thread, "frames to the panel: a helper");
+		thread_deallocate(thread);
+	}
 	fBase = (uint8_t *) vinfo.v_baseaddr;
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
@@ -530,67 +573,27 @@ sample_at(int64_t i, int64_t in, int64_t out)
 }
 
 /*
- * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
- * panel may be of another size, and the layer itself may be scaled: both are done in one
- * step, bilinear (or nearest neighbour: fb_filter=0).
+ * The rows of one layer, from `y0` to `y1` (panel rows), as drawLayer() has worked them out:
+ * scaling a whole frame takes one processor some 9 ms, so with boot-arg fb_threads=N it is shared
+ * out between N of them, each with rows of its own and a row of blending of its own.
  */
+struct RowJob {
+	const uint8_t * pixels;
+	uint32_t        stride;
+	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
+	bool            filter, unscaled;
+};
+
 void
-IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
+IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow)
 {
-	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
-	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
-	const uint8_t * pixels = s->pixels();
-	uint32_t stride = s->info.bytesPerRow;
-	int32_t px0, py0, px1, py1, cx0, cx1;
-	bool filter = gFilter != 0;
+	const uint8_t * pixels = job->pixels;
+	uint32_t stride = job->stride;
+	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
+	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
+	bool filter = job->filter;
 
-	if (sw <= 0 || sh <= 0) {
-		sx = sy = 0;
-		sw = (int32_t) s->info.width;
-		sh = (int32_t) s->info.height;
-	}
-	if (dw <= 0 || dh <= 0) {
-		dx = dy = 0;
-		dw = (int32_t) fWidth;
-		dh = (int32_t) fHeight;
-	}
-	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
-		return;
-	}
-	/* the rectangle on the panel */
-	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
-	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
-	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
-	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
-	if (px1 <= px0 || py1 <= py0) {
-		return;
-	}
-	/* (blending, a row of the picture mixed from two: room for it) */
-	if (filter && fBlendRowSize < (uint32_t) sw) {
-		if (fBlendRow != NULL) {
-			IODelete(fBlendRow, uint32_t, fBlendRowSize);
-		}
-		fBlendRowSize = (uint32_t) sw;
-		fBlendRow = IONew(uint32_t, fBlendRowSize);
-		if (fBlendRow == NULL) {
-			fBlendRowSize = 0;
-		}
-	}
-	filter = filter && fBlendRow != NULL;
-	/* which pixel of a source row each pixel of a panel row takes: worked out once, not 2.6 million times */
-	cx0 = px0 < 0 ? 0 : px0;
-	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
-	for (int32_t x = cx0; x < cx1; x++) {
-		if (filter) {
-			int64_t at = sample_at(x - px0, sw, px1 - px0);
-
-			fColumn[x] = (uint32_t) (at >> 8);              /* (in the blended row: from sx on) */
-			fColumnWeight[x] = (uint16_t) (fColumn[x] + 1 < (uint32_t) sw ? at & 255 : 0);
-		} else {
-			fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
-		}
-	}
-	for (int32_t y = py0; y < py1; y++) {
+	for (int32_t y = y0; y < y1; y++) {
 		const uint32_t * from;
 		uint32_t * to;
 
@@ -598,7 +601,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 			continue;
 		}
 		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
-		if (px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth) {
+		if (job->unscaled) {
 			/* not scaled at all */
 			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
 			continue;
@@ -614,14 +617,14 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 				const uint32_t * lower = (const uint32_t *) (pixels + (size_t) (sy + row + 1) * stride) + sx;
 				uint32_t first = fColumn[cx0], last = fColumn[cx1 - 1] + 1 < (uint32_t) sw ? fColumn[cx1 - 1] + 1 : fColumn[cx1 - 1];
 
-				uint32_t * __restrict mixed = fBlendRow;
+				uint32_t * __restrict mixed = blendRow;
 
 				for (uint32_t c = first; c <= last; c++) {
 					uint32_t a = upper[c], b = lower[c];
 
 					mixed[c] = a == b ? a : blend(a, b, weight);           /* (most of a screen is the same as next to it) */
 				}
-				from = fBlendRow;
+				from = blendRow;
 			}
 		} else {
 			from = (const uint32_t *) (pixels + (size_t) (sy + (int64_t) (y - py0) * sh / (py1 - py0)) * stride);
@@ -656,6 +659,149 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 			}
 		}
 	}
+}
+
+/* A helper of the scaling (fb_threads): waits for rows to do, does them, says so. */
+void
+IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
+{
+	IOMobileFramebuffer * fb = (IOMobileFramebuffer *) self;
+	unsigned index;
+	uint64_t done = 0;
+
+	IOLockLock(fb->fHelperLock);
+	index = fb->fHelpersStarted++;
+	IOLockUnlock(fb->fHelperLock);
+	for (;;) {
+		const RowJob * job;
+		int32_t rows, y0, y1;
+		uint32_t * blend;
+
+		IOLockLock(fb->fHelperLock);
+		while (fb->fHelperGeneration == done) {
+			IOLockSleep(fb->fHelperLock, &fb->fHelperGeneration, THREAD_UNINT);
+		}
+		done = fb->fHelperGeneration;
+		job = fb->fHelperJob;
+		IOLockUnlock(fb->fHelperLock);
+		/* share index + 1 of fThreads (the presenter takes share 0) */
+		rows = job->py1 - job->py0;
+		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
+		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
+		blend = fb->fHelperBlend[index];
+		fb->drawRows(job, y0, y1, blend);
+		IOLockLock(fb->fHelperLock);
+		fb->fHelpersBusy--;
+		if (fb->fHelpersBusy == 0) {
+			IOLockWakeup(fb->fHelperLock, &fb->fHelpersBusy, true);
+		}
+		IOLockUnlock(fb->fHelperLock);
+	}
+}
+
+/*
+ * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
+ * panel may be of another size, and the layer itself may be scaled: both are done in one
+ * step, bilinear (or nearest neighbour: fb_filter=0).
+ */
+void
+IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
+{
+	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
+	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
+	int32_t px0, py0, px1, py1, cx0, cx1;
+	bool filter = gFilter != 0;
+	RowJob job;
+
+	if (sw <= 0 || sh <= 0) {
+		sx = sy = 0;
+		sw = (int32_t) s->info.width;
+		sh = (int32_t) s->info.height;
+	}
+	if (dw <= 0 || dh <= 0) {
+		dx = dy = 0;
+		dw = (int32_t) fWidth;
+		dh = (int32_t) fHeight;
+	}
+	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
+		return;
+	}
+	/* the rectangle on the panel */
+	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
+	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
+	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
+	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
+	if (px1 <= px0 || py1 <= py0) {
+		return;
+	}
+	/* (blending, a row of the picture mixed from two: room for it, for every one who draws rows) */
+	if (filter && fBlendRowSize < (uint32_t) sw) {
+		if (fBlendRow != NULL) {
+			IODelete(fBlendRow, uint32_t, fBlendRowSize);
+		}
+		for (unsigned i = 0; i + 1 < fThreads; i++) {
+			if (fHelperBlend[i] != NULL) {
+				IODelete(fHelperBlend[i], uint32_t, fBlendRowSize);
+			}
+		}
+		fBlendRowSize = (uint32_t) sw;
+		fBlendRow = IONew(uint32_t, fBlendRowSize);
+		for (unsigned i = 0; i + 1 < fThreads; i++) {
+			fHelperBlend[i] = IONew(uint32_t, fBlendRowSize);
+			if (fHelperBlend[i] == NULL && fBlendRow != NULL) {
+				IODelete(fBlendRow, uint32_t, fBlendRowSize);
+				fBlendRow = NULL;
+			}
+		}
+		if (fBlendRow == NULL) {
+			fBlendRowSize = 0;
+		}
+	}
+	filter = filter && fBlendRow != NULL;
+	/* which pixel of a source row each pixel of a panel row takes: worked out once, not 2.6 million times */
+	cx0 = px0 < 0 ? 0 : px0;
+	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
+	for (int32_t x = cx0; x < cx1; x++) {
+		if (filter) {
+			int64_t at = sample_at(x - px0, sw, px1 - px0);
+
+			fColumn[x] = (uint32_t) (at >> 8);              /* (in the blended row: from sx on) */
+			fColumnWeight[x] = (uint16_t) (fColumn[x] + 1 < (uint32_t) sw ? at & 255 : 0);
+		} else {
+			fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
+		}
+	}
+	job.pixels = s->pixels();
+	job.stride = s->info.bytesPerRow;
+	job.sx = sx;
+	job.sy = sy;
+	job.sw = sw;
+	job.sh = sh;
+	job.px0 = px0;
+	job.py0 = py0;
+	job.px1 = px1;
+	job.py1 = py1;
+	job.cx0 = cx0;
+	job.cx1 = cx1;
+	job.filter = filter;
+	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
+		drawRows(&job, py0, py1, fBlendRow);
+		return;
+	}
+	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
+	IOLockLock(fHelperLock);
+	fHelperJob = &job;
+	fHelpersBusy = fThreads - 1;
+	fHelperGeneration++;
+	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
+	IOLockUnlock(fHelperLock);
+	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
+	IOLockLock(fHelperLock);
+	while (fHelpersBusy != 0) {
+		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
+	}
+	IOLockUnlock(fHelperLock);
 }
 
 /*
@@ -708,6 +854,9 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
+	if (gTouchLat) {
+		IOLog("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
+	}
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
 	fSwapTime = now;
@@ -765,8 +914,9 @@ void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
-	uint64_t began = mach_absolute_time(), nanos;
+	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
+	MiniIOSurface * recorded = NULL;
 	bool report;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
@@ -776,7 +926,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	fStatWaiting += mach_absolute_time() - began;
-	began = mach_absolute_time();
+	began = ready = mach_absolute_time();
 	if (gOnTheBeat) {
 		uint64_t period, aim, next;
 
@@ -801,6 +951,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			began = mach_absolute_time();
 		}
 	}
+	shown = began;
 	/* its turn has come: the swap after it may be handed over */
 	IOLockLock(fSwapLock);
 	fSwapThere = false;
@@ -868,11 +1019,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 			drawLayer(s, src, dst);
 			if (layer == 0) {
-				record(s);
+				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 		}
 	}
+	drawn = mach_absolute_time();
+	if (recorded != NULL) {
+		record(recorded);
+	}
 	fSwapsShown++;
+	if (gTouchLat) {
+		IOLog("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
+		    micros(drawn));
+	}
 	if (layers != fLayersShown) {
 		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
 		    fLayersShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
