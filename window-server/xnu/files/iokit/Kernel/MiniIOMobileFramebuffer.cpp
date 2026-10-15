@@ -127,6 +127,15 @@ static TUNABLE(uint32_t, gRecSeconds, "rec_secs", 0);
 static TUNABLE(uint32_t, gRecStart, "rec_start", 0);
 static TUNABLE(uint32_t, gRecMegabytes, "rec_mb", 480);
 static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
+/*
+ * Boot-arg fb_filter=0: the picture is scaled to the panel nearest neighbour, as it once was. The
+ * iPhone's 1125 x 2436 on this panel's 1080 x 2400 is 45 columns and 36 rows fewer: nearest
+ * neighbour leaves out every 25th column and every 67th row, and where one of them goes through a
+ * letter or a slanting line, that is a step in it or a stroke a pixel thinner -- text and lines a
+ * little crooked, here and there and never in the same places twice. By default every pixel of the
+ * panel is worked out from the four of the picture around where it falls (bilinear).
+ */
+static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 
@@ -219,6 +228,9 @@ public:
 	uint32_t        fDiffLeft, fDiffTop, fDiffRight, fDiffBottom;
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
+	uint16_t *      fColumnWeight;          /* ... with fb_filter: how much of the column after it, of 256 */
+	uint32_t *      fBlendRow;              /* ... and a row of the picture blended from two (fBlendRowSize pixels) */
+	uint32_t        fBlendRowSize;
 	uint8_t *       fRecBase;
 	uint64_t        fRecSize, fRecUsed;
 	uint64_t        fFirstFrame, fRecFirst; /* when the first frame was shown, and the first recorded */
@@ -353,6 +365,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		}
 	}
 	fColumn = IONewZero(uint32_t, fPanelWidth);
+	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
@@ -452,9 +465,33 @@ IOMobileFramebuffer::defaultSurface(void)
 }
 
 /*
+ * Two pixels mixed: `w` of 256 of the second. Two of the four channels at a time, in one word.
+ */
+static inline uint32_t
+blend(uint32_t a, uint32_t b, uint32_t w)
+{
+	uint32_t rb = ((a & 0xff00ff) * (256 - w) + (b & 0xff00ff) * w) >> 8 & 0xff00ff;
+	uint32_t ga = ((a >> 8 & 0xff00ff) * (256 - w) + (b >> 8 & 0xff00ff) * w) & 0xff00ff00;
+
+	return rb | ga;
+}
+
+/*
+ * Where the middle of the `i`th of `out` pixels falls among `in` of them, in 256ths of a pixel,
+ * kept within the first and the last.
+ */
+static inline int64_t
+sample_at(int64_t i, int64_t in, int64_t out)
+{
+	int64_t at = ((2 * i + 1) * in - out) * 128 / out;
+
+	return at < 0 ? 0 : at > (in - 1) * 256 ? (in - 1) * 256 : at;
+}
+
+/*
  * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
  * panel may be of another size, and the layer itself may be scaled: both are done in one
- * step, nearest neighbour.
+ * step, bilinear (or nearest neighbour: fb_filter=0).
  */
 void
 IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
@@ -464,6 +501,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	const uint8_t * pixels = s->pixels();
 	uint32_t stride = s->info.bytesPerRow;
 	int32_t px0, py0, px1, py1, cx0, cx1;
+	bool filter = gFilter != 0;
 
 	if (sw <= 0 || sh <= 0) {
 		sx = sy = 0;
@@ -486,11 +524,30 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (px1 <= px0 || py1 <= py0) {
 		return;
 	}
+	/* (blending, a row of the picture mixed from two: room for it) */
+	if (filter && fBlendRowSize < (uint32_t) sw) {
+		if (fBlendRow != NULL) {
+			IODelete(fBlendRow, uint32_t, fBlendRowSize);
+		}
+		fBlendRowSize = (uint32_t) sw;
+		fBlendRow = IONew(uint32_t, fBlendRowSize);
+		if (fBlendRow == NULL) {
+			fBlendRowSize = 0;
+		}
+	}
+	filter = filter && fBlendRow != NULL;
 	/* which pixel of a source row each pixel of a panel row takes: worked out once, not 2.6 million times */
 	cx0 = px0 < 0 ? 0 : px0;
 	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
 	for (int32_t x = cx0; x < cx1; x++) {
-		fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
+		if (filter) {
+			int64_t at = sample_at(x - px0, sw, px1 - px0);
+
+			fColumn[x] = (uint32_t) (at >> 8);              /* (in the blended row: from sx on) */
+			fColumnWeight[x] = (uint16_t) (fColumn[x] + 1 < (uint32_t) sw ? at & 255 : 0);
+		} else {
+			fColumn[x] = (uint32_t) (sx + (int64_t) (x - px0) * sw / (px1 - px0));
+		}
 	}
 	for (int32_t y = py0; y < py1; y++) {
 		const uint32_t * from;
@@ -499,15 +556,41 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
 			continue;
 		}
-		from = (const uint32_t *) (pixels + (size_t) (sy + (int64_t) (y - py0) * sh / (py1 - py0)) * stride);
 		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
-		if (px1 - px0 == sw && px0 >= 0 && (uint32_t) px1 <= fPanelWidth) {
-			memcpy(to + px0, from + sx, (size_t) sw * 4);
+		if (px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth) {
+			/* not scaled at all */
+			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
 			continue;
+		}
+		if (filter) {
+			int64_t at = sample_at(y - py0, sh, py1 - py0);
+			uint32_t row = (uint32_t) (at >> 8), weight = (uint32_t) (at & 255);
+			const uint32_t * upper = (const uint32_t *) (pixels + (size_t) (sy + row) * stride) + sx;
+
+			if (weight == 0 || row + 1 >= (uint32_t) sh) {
+				from = upper;
+			} else {
+				const uint32_t * lower = (const uint32_t *) (pixels + (size_t) (sy + row + 1) * stride) + sx;
+				uint32_t first = fColumn[cx0], last = fColumn[cx1 - 1] + 1 < (uint32_t) sw ? fColumn[cx1 - 1] + 1 : fColumn[cx1 - 1];
+
+				uint32_t * __restrict mixed = fBlendRow;
+
+				for (uint32_t c = first; c <= last; c++) {
+					uint32_t a = upper[c], b = lower[c];
+
+					mixed[c] = a == b ? a : blend(a, b, weight);           /* (most of a screen is the same as next to it) */
+				}
+				from = fBlendRow;
+			}
+		} else {
+			from = (const uint32_t *) (pixels + (size_t) (sy + (int64_t) (y - py0) * sh / (py1 - py0)) * stride);
 		}
 		if (fDiff) {
 			for (int32_t x = cx0; x < cx1; x++) {
-				if (to[x] != from[fColumn[x]]) {
+				uint32_t value = filter ? blend(from[fColumn[x]], from[fColumn[x] + (fColumnWeight[x] != 0)], fColumnWeight[x]) :
+				    from[fColumn[x]];
+
+				if (to[x] != value) {
 					fDiffPixels++;
 					fDiffLeft = (uint32_t) x < fDiffLeft ? (uint32_t) x : fDiffLeft;
 					fDiffRight = (uint32_t) x > fDiffRight ? (uint32_t) x : fDiffRight;
@@ -516,8 +599,20 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 				}
 			}
 		}
-		for (int32_t x = cx0; x < cx1; x++) {
-			to[x] = from[fColumn[x]];
+		if (filter) {
+			const uint32_t * __restrict column = fColumn + cx0;
+			const uint16_t * __restrict weights = fColumnWeight + cx0;
+			uint32_t * __restrict out = to + cx0;
+
+			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
+				uint32_t c = column[i], w = weights[i], a = from[c];
+
+				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
+			}
+		} else {
+			for (int32_t x = cx0; x < cx1; x++) {
+				to[x] = from[fColumn[x]];
+			}
 		}
 	}
 }
