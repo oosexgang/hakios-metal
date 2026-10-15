@@ -160,7 +160,7 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
-static TUNABLE(uint32_t, gQueue, "fb_queue", 1);
+static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned
 swapQueue(void)
 {
@@ -241,8 +241,9 @@ public:
 	 * frame waits at a time: the swap after it is held, in SwapEnd, until this one is being
 	 * copied to the panel. Whoever draws is so at most two frames ahead of the panel, and
 	 * needs a third surface to be that: CoreAnimation makes itself a new one for every frame.
-	 * Boot-arg fb_queue=2: two frames may wait. (CoreAnimation draws on a clock of its own; a
-	 * SwapEnd held past its next tick makes that tick late, and the clock goes on from there.)
+	 * By default two frames may wait (boot-arg fb_queue=1: one, as before): CoreAnimation draws on a
+	 * clock of its own, and a SwapEnd held past its next tick makes that tick late, the clock going
+	 * on from there (rc.jobs.fps: 28% of the frames over 16.7 ms with two, 33% with one).
 	 */
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
