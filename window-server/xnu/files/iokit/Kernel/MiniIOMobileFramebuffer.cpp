@@ -122,10 +122,23 @@ static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
  * hands it to the host ("xl recording"), where tools/recording.py makes a video of it.
  *
  *   struct rec_header, then per frame: struct rec_frame, width * height pixels (R, G, B)
+ *
+ * Boot-arg rec_ring=1: when the memory is full the recording does not stop but goes on over its
+ * oldest frames, so that what it holds at the end is the last of the run: for something that
+ * happens once in a long session, the run is ended right after it (five fingers) and the frames
+ * before it are there. The header ("RWREC003") says where the oldest frame is (frames are all
+ * the same size, one after the other) and when the recording began, in the kernel's time, for the
+ * frames to be matched with what the window server's per-frame lines (glframes=1,
+ * userland/src/eagl.c) say. rec_step=N (2 to 8, default 3) keeps one pixel of every N instead of 3:
+ * N = 4 holds 1.8 times as many frames, 6 four times. The memory is taken from the system's for the
+ * whole run: 640 MB of it under a long session of applications had iOS killing processes for
+ * memory, SpringBoard and the window server among them (two respring in one run); 256 did not.
  */
 static TUNABLE(uint32_t, gRecSeconds, "rec_secs", 0);
 static TUNABLE(uint32_t, gRecStart, "rec_start", 0);
 static TUNABLE(uint32_t, gRecMegabytes, "rec_mb", 480);
+static TUNABLE(uint32_t, gRecRing, "rec_ring", 0);
+static TUNABLE(uint32_t, gRecStep, "rec_step", 3);
 static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
 /*
  * Boot-arg fb_filter=0: the picture is scaled to the panel nearest neighbour, as it once was. The
@@ -144,13 +157,19 @@ refreshHz(void)
 {
 	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
 }
-#define REC_STEP        3
+static inline uint32_t
+recStep(void)
+{
+	return gRecStep >= 2 && gRecStep <= 8 ? gRecStep : 3;
+}
+#define REC_STEP        recStep()
 
 struct rec_header {
-	char     magic[8];              /* "RWREC002" */
+	char     magic[8];              /* "RWREC003" */
 	uint32_t width, height;
 	uint32_t frames;
-	uint32_t reserved;
+	uint32_t oldest;                /* the place of the oldest frame (rec_ring; 0 until the memory has once been full) */
+	uint64_t began;                 /* when the first frame was recorded, in nanoseconds of the kernel's time */
 };
 struct rec_frame {
 	uint64_t nanoseconds;           /* since the first frame of the recording */
@@ -235,6 +254,7 @@ public:
 	uint64_t        fRecSize, fRecUsed;
 	uint64_t        fFirstFrame, fRecFirst; /* when the first frame was shown, and the first recorded */
 	bool            fRecDone;
+	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
@@ -383,14 +403,15 @@ IOMobileFramebuffer::start(IOService * provider)
 			fRecSize = (uint64_t) gRecMegabytes << 20;
 			fRecUsed = sizeof(*header);
 			bzero(header, sizeof(*header));
-			memcpy(header->magic, "RWREC002", 8);
+			memcpy(header->magic, "RWREC003", 8);
 			header->width = fWidth / REC_STEP;
 			header->height = fHeight / REC_STEP;
 			loader_recording[0] = memory->getPhysicalSegment(0, NULL);
 			loader_recording[1] = fRecUsed;
 			loader_recording[2] = (uint64_t) (uintptr_t) fRecBase;
-			IOLog("MiniIOMobileFramebuffer: recording %u s of the screen at %ux%u from second %u, into %u MB at %#llx\n",
-			    gRecSeconds, header->width, header->height, gRecStart, gRecMegabytes, loader_recording[0]);
+			IOLog("MiniIOMobileFramebuffer: recording %u s of the screen at %ux%u from second %u, into %u MB at %#llx%s\n",
+			    gRecSeconds, header->width, header->height, gRecStart, gRecMegabytes, loader_recording[0],
+			    gRecRing ? ", the last of it kept (rec_ring)" : "");
 		} else {
 			IOLog("MiniIOMobileFramebuffer: no memory for a recording of %u MB\n", gRecMegabytes);
 		}
@@ -410,7 +431,7 @@ void
 IOMobileFramebuffer::record(MiniIOSurface * s)
 {
 	struct rec_header * header = (struct rec_header *) fRecBase;
-	uint64_t now = mach_absolute_time(), since_first, since_start = 0;
+	uint64_t now = mach_absolute_time(), since_first, since_start = 0, frame_size;
 	struct rec_frame * frame;
 	uint8_t * to;
 
@@ -425,14 +446,25 @@ IOMobileFramebuffer::record(MiniIOSurface * s)
 		return;
 	}
 	if (fRecFirst == 0) {
+		uint64_t began;
+
 		fRecFirst = now;
+		absolutetime_to_nanoseconds(now, &began);
+		header->began = began;
+		IOLog("MiniIOMobileFramebuffer: the recording begins at %llu.%03llu s of the kernel's time (mach_absolute_time)\n",
+		    began / NSEC_PER_SEC, began / NSEC_PER_MSEC % 1000);
 	}
 	absolutetime_to_nanoseconds(now - fRecFirst, &since_start);
-	if (since_start > (uint64_t) gRecSeconds * NSEC_PER_SEC ||
-	    fRecUsed + sizeof(*frame) + (uint64_t) header->width * header->height * 3 > fRecSize) {
+	frame_size = sizeof(*frame) + (uint64_t) header->width * header->height * 3;
+	if (since_start > (uint64_t) gRecSeconds * NSEC_PER_SEC || (fRecUsed + frame_size > fRecSize && !gRecRing)) {
 		fRecDone = true;
 		IOLog("MiniIOMobileFramebuffer: recording finished: %u frames, %llu MB\n", header->frames, fRecUsed >> 20);
 		return;
+	}
+	if (fRecUsed + frame_size > fRecSize) {
+		/* (rec_ring) round again: over the oldest, which is the next one */
+		fRecUsed = sizeof(*header);
+		fRecWrapped = true;
 	}
 	frame = (struct rec_frame *) (fRecBase + fRecUsed);
 	frame->nanoseconds = since_start;
@@ -448,9 +480,18 @@ IOMobileFramebuffer::record(MiniIOSurface * s)
 			*to++ = (uint8_t) pixel;
 		}
 	}
-	fRecUsed += sizeof(*frame) + (uint64_t) header->width * header->height * 3;
-	header->frames++;
-	loader_recording[1] = fRecUsed;
+	fRecUsed += frame_size;
+	if (!fRecWrapped) {
+		header->frames++;
+		loader_recording[1] = fRecUsed;
+	} else {
+		/* the memory full of frames: all of them are handed over, from the one after this */
+		header->oldest = (uint32_t) ((fRecUsed - sizeof(*header)) / frame_size);
+		if (header->oldest >= header->frames) {
+			header->oldest = 0;
+		}
+		loader_recording[1] = sizeof(*header) + (uint64_t) header->frames * frame_size;
+	}
 }
 
 MiniIOSurface *
