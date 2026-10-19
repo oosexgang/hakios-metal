@@ -39,6 +39,8 @@
 #include "null/null_sw_winsys.h"
 #ifdef GALLIUM_FREEDRENO
 #include "freedreno/drm/freedreno_drm_public.h"
+#include "util/driconf.h"
+#include "util/xmlconfig.h"
 #include <xf86drm.h>
 #endif
 #include "util/format/u_format.h"
@@ -234,7 +236,25 @@ main(int argc, char **argv)
    if (!debug_get_bool_option("AIR_RUN_SOFTWARE", false)) {
       int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
       if (fd >= 0) {
+         /* The driver option cache has to be real, not a zeroed struct:
+          * fd_screen_create passes it straight to driParseConfigFiles, which
+          * dereferences it. A zeroed one died at address 0x10 on the phone --
+          * the first thing this program ever did on a machine that has a GPU,
+          * and invisible on any machine that has not. This is the sequence
+          * osmesa_create_gpu_screen() uses in tools/mesa/freedreno-darwin.patch,
+          * which is the one CoreAnimation goes through on this device daily.
+          */
+         static const driOptionDescription freedreno_options[] = {
+#include "freedreno/driinfo_freedreno.h"
+         };
+         static driOptionCache info, cache;
          static struct pipe_screen_config config;
+
+         driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
+         driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+         config.options = &cache;
+         config.options_info = &info;
+
          screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
          if (!screen)
             fprintf(stderr, "air_run: the msm device opened but gave no screen\n");
