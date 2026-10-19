@@ -60,9 +60,17 @@ struct air_resource {
    unsigned index;   /* Metal's [[buffer(n)]], [[texture(n)]], [[sampler(n)]] */
    unsigned size;    /* air.buffer_size when given, else 0 */
    bool read, write;
-   unsigned param;   /* the entry point's parameter */
+   unsigned param;   /* the entry point's parameter; ~0u for an inline sampler */
    const char *name; /* air.arg_name */
    const char *type_name;
+
+   /* A sampler the shader declares itself (Metal's constexpr sampler) rather
+    * than one the API binds: the runtime has to create it from this state
+    * word and bind it at .index, which the frontend assigns after the API's
+    * samplers. The word's layout is not decoded yet -- see docs/air.md.
+    */
+   bool inline_sampler;
+   uint64_t sampler_state;
 };
 
 struct air_varying {

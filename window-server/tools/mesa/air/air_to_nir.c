@@ -672,9 +672,13 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       bool sample = md_key(node, "air.sample") >= 0;
       bool read = md_key(node, "air.read") >= 0;
       bool write = md_key(node, "air.write") >= 0 || md_key(node, "air.read_write") >= 0;
+      /* A texture the shader writes is an image to Gallium, with its own
+       * binding space; one it only samples or reads is a sampler view.
+       */
       struct air_ptr p = {
-         .class = (sample || (read && !write)) ? AIR_PTR_TEXTURE : AIR_PTR_TEXTURE,
+         .class = AIR_PTR_TEXTURE,
          .binding = index,
+         .is_image = write,
       };
       add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
                    sample || read, write, param, node);
@@ -1368,9 +1372,16 @@ translate_body(struct air_ctx *c)
          }
       }
 
-      /* where the phi stores of this block's successors go */
+      /* Where the phi stores of this block's successors go. A nop marks the
+       * spot: without it, a block whose only instruction is its terminator
+       * leaves the cursor at the end of the block, and a store put there
+       * lands after the jump -- which NIR asserts on. vtn marks its blocks
+       * the same way (vtn_cfg.c's end_nop).
+       */
+      nir_instr *end = &nir_nop(&c->b)->instr;
+      nir_cursor at_end = nir_after_instr(end);
       _mesa_hash_table_insert(c->phi_cursors, blk,
-                              ralloc_memdup(c->mem_ctx, &c->b.cursor, sizeof(c->b.cursor)));
+                              ralloc_memdup(c->mem_ctx, &at_end, sizeof(at_end)));
 
       const struct air_inst *term = blk->insts[blk->num_insts - 1];
       switch (term->op) {
@@ -1478,9 +1489,32 @@ translate_globals(struct air_ctx *c)
          p.class = AIR_PTR_FUNCTION_CONSTANT;
          p.binding = idx;
       } else if (!strncmp(name, "__air_sampler_state", 19)) {
-         /* an inline sampler; its state word is g->init (docs/air.md 7.7) */
+         /* A sampler the shader declares itself. It needs a real index, not a
+          * sentinel: the Adreno's texture instruction holds the sampler in a
+          * four-bit field, and ~0u there asserts in ir3's encoder. The index
+          * goes after the API's samplers, and the runtime creates the sampler
+          * from the state word (docs/air.md section 7.7).
+          */
+         unsigned next = 0;
+         for (unsigned k = 0; k < c->info->num_resources; k++)
+            if (c->info->resources[k].kind == AIR_RESOURCE_SAMPLER)
+               next = MAX2(next, c->info->resources[k].index + 1);
          p.class = AIR_PTR_SAMPLER;
-         p.binding = ~0u;
+         p.binding = next;
+
+         uint64_t word = 0;
+         if (g->init && !air_const_uint(g->init, &word)) {
+            air_error(c, "interface: an inline sampler whose state is not a constant");
+            return;
+         }
+         struct air_shader_info *info = c->info;
+         info->resources = reralloc(c->mem_ctx, info->resources, struct air_resource,
+                                    info->num_resources + 1);
+         info->resources[info->num_resources++] = (struct air_resource) {
+            .kind = AIR_RESOURCE_SAMPLER, .index = next, .read = true,
+            .param = ~0u, .name = name,
+            .inline_sampler = true, .sampler_state = word,
+         };
       } else if (g->addrspace == 3) {
          /* a static threadgroup array */
          unsigned align = MAX2(g->align, air_type_abi_align(c->m, g->value_type));

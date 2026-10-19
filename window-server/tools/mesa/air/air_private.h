@@ -34,6 +34,7 @@ enum air_ptr_class {
 struct air_ptr {
    enum air_ptr_class class;
    unsigned binding;
+   bool is_image;                    /* a texture the shader writes: an image, not a view */
    nir_def *offset;                  /* bytes, 32-bit; NULL means zero */
    const struct air_type *pointee;   /* for sizes, and for loads without a type */
 };

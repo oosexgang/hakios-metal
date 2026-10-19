@@ -41,8 +41,70 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <signal.h>
+#include <ucontext.h>
+#endif
+
 #define WIDTH 4
 #define HEIGHT 4
+
+#ifdef __APPLE__
+/*
+ * A program that dies on this port leaves nothing behind: the kernel says
+ * "Failed to send exception EXC_CORPSE_NOTIFY" and that is the end of it. So
+ * print the fault before dying. These two functions are userland/src/inject.c's
+ * say_the_fault()/watch_for_faults() (branch sileo2, 6683521), with the slide
+ * taken from this program's own image rather than from the shared cache, since
+ * the pc of interest is in air_run or in libOSMesa and not in iOS.
+ */
+static void
+say_the_fault(int signal_number, siginfo_t *info, void *context_in)
+{
+   ucontext_t *context = context_in;
+   uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+   uintptr_t pc = 0, lr = 0, fp = 0;
+
+   if (context != NULL && context->uc_mcontext != NULL) {
+      pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
+      lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
+      fp = (uintptr_t)context->uc_mcontext->__ss.__fp;
+   }
+   /* who called, by the frame pointers: on arm64 each frame holds the previous
+    * at [fp] and its return address at [fp + 8]
+    */
+   char frames[8 * 20 + 1] = "";
+   size_t used = 0;
+   for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
+      uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+      if (ret == 0)
+         break;
+      used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
+      fp = next > fp ? next : 0;   /* the chain only ever goes up the stack */
+   }
+   fprintf(stderr, "air_run: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n",
+           signal_number, info != NULL ? info->si_addr : NULL, pc - slide, lr - slide,
+           frames);
+   fflush(stderr);
+   signal(signal_number, SIG_DFL);
+   raise(signal_number);
+}
+
+static void
+watch_for_faults(void)
+{
+   struct sigaction action;
+
+   memset(&action, 0, sizeof(action));
+   action.sa_sigaction = say_the_fault;
+   action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+   sigaction(SIGSEGV, &action, NULL);
+   sigaction(SIGBUS, &action, NULL);
+}
+#else
+static void watch_for_faults(void) {}
+#endif
 
 /* the pattern cpuref.py and air2nir --eval fill their buffers with, so that
  * all three agree on what the shader was given
@@ -104,6 +166,7 @@ main(int argc, char **argv)
       return 2;
    }
 
+   watch_for_faults();
    glsl_type_singleton_init_or_ref();
    void *ctx = ralloc_context(NULL);
 
