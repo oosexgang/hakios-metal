@@ -38,12 +38,58 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
+#import <signal.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <sys/wait.h>
+#import <time.h>
+#import <unistd.h>
 
 extern CFTypeRef MGCopyAnswer(CFStringRef key);
 
 #define EXTENSIONS      "/System/Library/Extensions"
+
+/*
+ * Two of the things asked below can take the process down with them, and did: asking CoreImage for
+ * its default context killed metal_test outright on this system (nothing printed, no crash report),
+ * and taking a plug-in bundle's principal class runs Apple's own driver code. Each is therefore run
+ * in a child of its own: whatever happens to the child, the parent says how it ended and goes on.
+ * A child that wedges instead of dying is given `secs` and then killed, which is itself an answer.
+ */
+static void
+in_a_child(const char *what, int secs, void (*body)(void))
+{
+	pid_t pid = fork();
+	int status = 0, waited = 0;
+
+	if (pid < 0) {
+		printf("metal_test:   cannot fork to ask about %s\n", what);
+		return;
+	}
+	if (pid == 0) {
+		body();
+		_exit(0);
+	}
+	/* waitpid without hanging for ever: a wedged child is news too */
+	while (waitpid(pid, &status, WNOHANG) == 0) {
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+
+		nanosleep(&ts, NULL);
+		if (++waited > secs * 10) {
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			printf("metal_test:   %s: still going after %d s, killed (it wedges here)\n", what, secs);
+			return;
+		}
+	}
+	if (WIFSIGNALED(status)) {
+		printf("metal_test:   %s: the process died of signal %d right there\n", what, WTERMSIG(status));
+	} else if (WEXITSTATUS(status) != 0) {
+		printf("metal_test:   %s: ended with status %d\n", what, WEXITSTATUS(status));
+	}
+}
 
 /* A string property of an IOKit service, or NULL; the caller frees it. */
 static char *
@@ -235,11 +281,14 @@ gestalt(void)
  * A framework that has a path without Metal: CoreImage. A filter kernel is run over four pixels
  * and the result read back, which tells whether this system can process an image at all.
  */
+/* `options` is nil for the default context, or a dictionary to ask for something else. */
+static NSDictionary *coreimage_options;
+
 static void
 coreimage(void)
 {
 	@autoreleasepool {
-		CIContext *context = [CIContext contextWithOptions:nil];
+		CIContext *context;
 		CIImage *source, *result;
 		CIFilter *filter;
 		CGImageRef image;
@@ -248,11 +297,41 @@ coreimage(void)
 		CGColorSpaceRef space;
 		CGContextRef bitmap;
 
+		/* said before the call, not after: this is the call that was dying */
+		printf("metal_test:   asking for a CIContext (%s)...\n",
+		    coreimage_options == nil ? "the default one" : "software renderer");
+		context = [CIContext contextWithOptions:coreimage_options];
 		if (context == nil) {
 			printf("metal_test:   no CIContext: CoreImage cannot work here\n");
 			return;
 		}
+		/*
+		 * Which of CoreImage's two backends the default context took. iOS 16.5 has both:
+		 * CI::GLContext (with CI::GLMainProgram, CI::GLTextureManager) and CI::MetalContext
+		 * (with CI::MetalDAG, CI::MetalKernel); -[CIContext initWithOptions:] chooses between
+		 * them by CIGLIsUsable(). -isOpenGLBased and -device are private, so they are asked for
+		 * only if they are there.
+		 */
 		printf("metal_test:   CIContext: %s\n", class_getName([context class]));
+		/*
+		 * Sent through a typed objc_msgSend, not -performSelector:, because -isOpenGLBased
+		 * returns a BOOL and not an object: ARC would take the return value for one.
+		 */
+		SEL gl_sel = @selector(isOpenGLBased);
+		if ([context respondsToSelector:gl_sel]) {
+			BOOL (*ask)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+			printf("metal_test:   backend: %s\n", ask(context, gl_sel)
+			    ? "OpenGL ES (CI::GLContext)" : "Metal (CI::MetalContext)");
+		} else {
+			printf("metal_test:   backend: -isOpenGLBased is not there to ask\n");
+		}
+		SEL dev_sel = @selector(device);
+		if ([context respondsToSelector:dev_sel]) {
+			id (*ask_device)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+			id device = ask_device(context, dev_sel);
+			printf("metal_test:   the context's Metal device: %s\n",
+			    device ? class_getName([device class]) : "nil");
+		}
 		/* orange, inverted by a kernel: 1, 0.5, 0 -> 0, 0.5, 1 */
 		source = [[CIImage imageWithColor:[CIColor colorWithRed:1.0 green:0.5 blue:0.0]]
 		    imageByCroppingToRect:rect];
@@ -267,6 +346,7 @@ coreimage(void)
 			printf("metal_test:   the filter gave no image\n");
 			return;
 		}
+		printf("metal_test:   running the filter kernel...\n");
 		image = [context createCGImage:result fromRect:rect];
 		if (image == NULL) {
 			printf("metal_test:   CoreImage did not render: a filter kernel cannot run here\n");
@@ -292,17 +372,26 @@ coreimage(void)
 int
 main(void)
 {
+	/* every line as it happens: a call that kills the process must not take the log with it */
+	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("metal_test: the services Metal looks for (IOAcceleratorES)\n");
 	accelerators();
 	printf("metal_test: what the registry has that is a GPU\n");
 	gpu_services();
-	printf("metal_test: the plug-in bundles of %s\n", EXTENSIONS);
-	plugins();
 	printf("metal_test: the device a program gets\n");
 	the_device();
 	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
 	gestalt();
 	printf("metal_test: CoreImage, which has a path without Metal\n");
-	coreimage();
+	in_a_child("the default CIContext", 30, coreimage);
+	coreimage_options = @{ @"kCIContextUseSoftwareRenderer": @YES };
+	in_a_child("a software-renderer CIContext", 30, coreimage);
+	/*
+	 * Last on purpose: taking a bundle's principal class loads that bundle's code and runs its
+	 * initialisers -- for AGXMetalA11.bundle, Apple's own driver for the A11's GPU, which this
+	 * image does carry.
+	 */
+	printf("metal_test: the plug-in bundles of %s (loads their code: kept last)\n", EXTENSIONS);
+	in_a_child("loading the plug-in bundles", 60, plugins);
 	return 0;
 }
