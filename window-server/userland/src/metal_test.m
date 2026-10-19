@@ -38,11 +38,14 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
+#import <OpenGLES/EAGL.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 #import <signal.h>
 #import <stdio.h>
 #import <stdlib.h>
+#import <spawn.h>
 #import <sys/wait.h>
 #import <time.h>
 #import <unistd.h>
@@ -52,27 +55,82 @@ extern CFTypeRef MGCopyAnswer(CFStringRef key);
 #define EXTENSIONS      "/System/Library/Extensions"
 
 /*
- * Two of the things asked below can take the process down with them, and did: asking CoreImage for
- * its default context killed metal_test outright on this system (nothing printed, no crash report),
- * and taking a plug-in bundle's principal class runs Apple's own driver code. Each is therefore run
- * in a child of its own: whatever happens to the child, the parent says how it ended and goes on.
- * A child that wedges instead of dying is given `secs` and then killed, which is itself an answer.
+ * Where a crash happened, in the addresses of the dyld shared cache as ipsw prints them.
+ *
+ * The cache is loaded at a sliding address, so a program counter means nothing by itself. The slide
+ * is worked out from one symbol whose unslid address is known from the cache
+ * (MTLCreateSystemDefaultDevice, 0x181a34b3c in 20F66 for iPhone10,3): slide = where it is now
+ * minus where the cache says it is. Subtracting that from a program counter gives an address
+ * `ipsw dyld a2s <cache> <address>` can name. The same trick is what src/inject.c does in reverse.
+ */
+#define MTL_CREATE_DEVICE_UNSLID 0x181a34b3cUL
+
+static uintptr_t
+cache_slide(void)
+{
+	return (uintptr_t)&MTLCreateSystemDefaultDevice - MTL_CREATE_DEVICE_UNSLID;
+}
+
+static void
+fault(int sig, siginfo_t *info, void *uap)
+{
+	ucontext_t *uc = uap;
+	uintptr_t slide = cache_slide();
+	uintptr_t pc = 0, lr = 0, fp = 0;
+
+	if (uc != NULL && uc->uc_mcontext != NULL) {
+		pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+		lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+		fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+	}
+	/* async-signal-safe enough for a diagnostic that is about to exit anyway */
+	printf("metal_test:     signal %d at address %p\n", sig, info != NULL ? info->si_addr : NULL);
+	printf("metal_test:     pc  %#lx unslid (cache slide %#lx)\n", pc - slide, slide);
+	printf("metal_test:     lr  %#lx unslid\n", lr - slide);
+	for (int i = 0; i < 8 && fp > 0x1000; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		printf("metal_test:     #%d  %#lx unslid\n", i, ret - slide);
+		if (next <= fp) {
+			break;
+		}
+		fp = next;
+	}
+	_exit(99);
+}
+
+/*
+ * Some of what is asked below can take the process down with it, so each such question is asked by
+ * a fresh process: metal_test re-executes itself with the question as its argument (see main()).
+ *
+ * It must be a new process and not just a forked one. A forked child may not use Objective-C at
+ * all when the parent had more than one thread, and metal_test does -- linking CoreImage and
+ * OpenGLES is enough. A first attempt did fork, and every probe then died of SIGABRT inside the
+ * runtime itself:
+ *
+ *   objc[98]: +[__NSCFNumber initialize] may have been in progress in another thread when fork()
+ *   was called. We cannot safely call it or ignore it in the fork() child process. Crashing
+ *   instead.
+ *
+ * -- objc_initializeAfterForkError, which says nothing whatever about CoreImage. exec() clears
+ * that, because the runtime starts afresh.
  */
 static void
-in_a_child(const char *what, int secs, void (*body)(void))
+in_a_new_process(const char *what, const char *argument, int secs)
 {
-	pid_t pid = fork();
+	extern char **environ;
+	char *const argv[] = { (char *)"/redwood/bin/metal_test", (char *)argument, NULL };
+	pid_t pid;
 	int status = 0, waited = 0;
 
-	if (pid < 0) {
-		printf("metal_test:   cannot fork to ask about %s\n", what);
+	printf("metal_test: %s (asked by a process of its own)\n", what);
+	if (posix_spawn(&pid, argv[0], NULL, NULL, argv, environ) != 0) {
+		printf("metal_test:   cannot start %s %s\n", argv[0], argument);
 		return;
 	}
-	if (pid == 0) {
-		body();
-		_exit(0);
-	}
-	/* waitpid without hanging for ever: a wedged child is news too */
 	while (waitpid(pid, &status, WNOHANG) == 0) {
 		struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
 
@@ -85,7 +143,9 @@ in_a_child(const char *what, int secs, void (*body)(void))
 		}
 	}
 	if (WIFSIGNALED(status)) {
-		printf("metal_test:   %s: the process died of signal %d right there\n", what, WTERMSIG(status));
+		printf("metal_test:   %s: died of signal %d\n", what, WTERMSIG(status));
+	} else if (WEXITSTATUS(status) == 99) {
+		printf("metal_test:   %s: it faulted, and said above where\n", what);
 	} else if (WEXITSTATUS(status) != 0) {
 		printf("metal_test:   %s: ended with status %d\n", what, WEXITSTATUS(status));
 	}
@@ -283,6 +343,69 @@ gestalt(void)
  */
 /* `options` is nil for the default context, or a dictionary to ask for something else. */
 static NSDictionary *coreimage_options;
+/* ... or the context is made over an EAGLContext of ours instead (coreimage_eagl). */
+static int coreimage_over_eagl;
+
+/*
+ * The way back for CoreImage, if there is one. iOS 16.5's CoreImage carries a whole second back
+ * end on OpenGL ES -- CI::GLContext, CI::GLMainProgram, CI::GLTextureManager beside the
+ * CI::MetalContext family -- it is linked against OpenGLES, it compiles its shaders as GLSL (not
+ * AIR), and CIGLIsUsable() is compiled to "return 1". The public way in is
+ * +[CIContext contextWithEAGLContext:], and the one thing it wants of the library underneath,
+ * CIEAGLContextTexImageIOSurface, is a call src/eagl.c already answers for CoreAnimation. So: make
+ * an EAGLContext (which on an image built with GL=1, on a phone with gpu=1, is our Mesa behind
+ * src/eagl.c) and hand it over.
+ */
+#define REDWOOD_GL      "/redwood/lib/libredwood-gl.dylib"
+
+static EAGLContext *
+make_eagl(void)
+{
+	EAGLContext *gl;
+
+	/*
+	 * Our OpenGL ES has to be put behind EAGLContext in THIS process first. libredwood.dylib does
+	 * it only for backboardd (src/inject.c, opengl_es(), which is called for that name alone), and
+	 * the way it does it -- replacing methods of EAGLContext through the ObjC runtime -- is local
+	 * to a process. The library installs itself from a constructor, so loading it is enough; what
+	 * it replaced it says itself in lines "redwood-gl:". Without this, EAGLContext here would be
+	 * iOS's own, which is AppleMetalGLRenderer over Metal -- the thing that is missing.
+	 */
+	if (access(REDWOOD_GL, R_OK) != 0) {
+		printf("metal_test:   %s is not in this image: build it with GL=1\n", REDWOOD_GL);
+		return nil;
+	}
+	/*
+	 * coreimage_over_eagl == 2: Mesa's software driver instead of the phone's GPU. Worth asking
+	 * separately, because the window server already holds the GPU while this runs: if freedreno
+	 * cannot have it too, softpipe still answers the question that matters -- whether CoreImage's
+	 * OpenGL ES back end works at all behind an EAGLContext of ours.
+	 */
+	if (coreimage_over_eagl == 2) {
+		setenv("OSMESA_SOFTWARE", "1", 1);
+		printf("metal_test:   OSMESA_SOFTWARE=1: Mesa's software driver, not the GPU\n");
+	}
+	if (dlopen(REDWOOD_GL, RTLD_NOW) == NULL) {
+		printf("metal_test:   %s: %s\n", REDWOOD_GL, dlerror());
+		return nil;
+	}
+	printf("metal_test:   %s loaded; EAGLContext is ours now\n", REDWOOD_GL);
+	gl = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
+
+	if (gl == nil) {
+		printf("metal_test:   no OpenGL ES 3 context; trying 2\n");
+		gl = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+	}
+	if (gl == nil) {
+		printf("metal_test:   no EAGLContext at all: this image has no OpenGL ES\n");
+		return nil;
+	}
+	printf("metal_test:   EAGLContext: %s, API %d\n", class_getName([gl class]), (int)[gl API]);
+	if (![EAGLContext setCurrentContext:gl]) {
+		printf("metal_test:   the EAGLContext would not become current\n");
+	}
+	return gl;
+}
 
 static void
 coreimage(void)
@@ -298,9 +421,18 @@ coreimage(void)
 		CGContextRef bitmap;
 
 		/* said before the call, not after: this is the call that was dying */
-		printf("metal_test:   asking for a CIContext (%s)...\n",
-		    coreimage_options == nil ? "the default one" : "software renderer");
-		context = [CIContext contextWithOptions:coreimage_options];
+		printf("metal_test:   asking for a CIContext (%s)...\n", coreimage_over_eagl ? "over an EAGLContext"
+		    : coreimage_options == nil ? "the default one" : "software renderer");
+		if (coreimage_over_eagl) {
+			EAGLContext *gl = make_eagl();
+
+			if (gl == nil) {
+				return;
+			}
+			context = [CIContext contextWithEAGLContext:gl];
+		} else {
+			context = [CIContext contextWithOptions:coreimage_options];
+		}
 		if (context == nil) {
 			printf("metal_test:   no CIContext: CoreImage cannot work here\n");
 			return;
@@ -370,10 +502,43 @@ coreimage(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	struct sigaction sa = { 0 };
+
 	/* every line as it happens: a call that kills the process must not take the log with it */
 	setvbuf(stdout, NULL, _IONBF, 0);
+	/* and where it died, since the kernel's report never arrives here (see fault()) */
+	sa.sa_sigaction = fault;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
+	sigaction(SIGTRAP, &sa, NULL);
+
+	/* one question, asked by a process of its own (see in_a_new_process) */
+	if (argc > 1) {
+		if (strcmp(argv[1], "ci-default") == 0) {
+			coreimage();
+		} else if (strcmp(argv[1], "ci-software") == 0) {
+			coreimage_options = @{ @"kCIContextUseSoftwareRenderer": @YES };
+			coreimage();
+		} else if (strcmp(argv[1], "ci-eagl") == 0) {
+			coreimage_over_eagl = 1;
+			coreimage();
+		} else if (strcmp(argv[1], "ci-eagl-software") == 0) {
+			coreimage_over_eagl = 2;
+			coreimage();
+		} else if (strcmp(argv[1], "plugins") == 0) {
+			plugins();
+		} else {
+			printf("metal_test: no such question: %s\n", argv[1]);
+			return 2;
+		}
+		return 0;
+	}
+
 	printf("metal_test: the services Metal looks for (IOAcceleratorES)\n");
 	accelerators();
 	printf("metal_test: what the registry has that is a GPU\n");
@@ -383,15 +548,21 @@ main(void)
 	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
 	gestalt();
 	printf("metal_test: CoreImage, which has a path without Metal\n");
-	in_a_child("the default CIContext", 30, coreimage);
-	coreimage_options = @{ @"kCIContextUseSoftwareRenderer": @YES };
-	in_a_child("a software-renderer CIContext", 30, coreimage);
+	/*
+	 * The ones that matter go first: a session can run out before the end, and these are the
+	 * answer everything else is waiting for. The default context is known to crash in
+	 * CI::GLContext::init() with no GL context to work with (see docs/metal.md), so the question
+	 * is whether giving it one -- ours, Mesa behind src/eagl.c -- is enough.
+	 */
+	in_a_new_process("a CIContext over an EAGLContext (the GPU)", "ci-eagl", 120);
+	in_a_new_process("a CIContext over an EAGLContext (software Mesa)", "ci-eagl-software", 180);
+	in_a_new_process("the default CIContext", "ci-default", 60);
+	in_a_new_process("a software-renderer CIContext", "ci-software", 60);
 	/*
 	 * Last on purpose: taking a bundle's principal class loads that bundle's code and runs its
 	 * initialisers -- for AGXMetalA11.bundle, Apple's own driver for the A11's GPU, which this
 	 * image does carry.
 	 */
-	printf("metal_test: the plug-in bundles of %s (loads their code: kept last)\n", EXTENSIONS);
-	in_a_child("loading the plug-in bundles", 60, plugins);
+	in_a_new_process("loading the plug-in bundles of " EXTENSIONS, "plugins", 90);
 	return 0;
 }
