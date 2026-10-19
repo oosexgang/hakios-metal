@@ -79,10 +79,17 @@
 #define TEX_X 1
 #define TEX_Y 1
 
+/* Slot is in the value on purpose. Binding one texture to every slot makes a
+ * shader that reads the wrong slot return the right texel, which is a test
+ * passing for the wrong reason -- the third time that shape of mistake has
+ * turned up here, after the 2D texture bound for a 3D sampler and the colour
+ * attachment nothing stored to. Looked for deliberately this time rather than
+ * tripped over: slot n adds a thousand times n, so a misbinding is visible.
+ */
 static void
-texel_value(unsigned x, unsigned y, unsigned z, float out[4])
+texel_value(unsigned slot, unsigned x, unsigned y, unsigned z, float out[4])
 {
-   out[0] = 100.0f + x;
+   out[0] = 100.0f + x + 1000.0f * slot;
    out[1] = 200.0f + y;
    out[2] = 300.0f + x + y + z;
    out[3] = 400.0f;
@@ -549,31 +556,33 @@ main(int argc, char **argv)
       unsigned depth = target == PIPE_TEXTURE_3D ? TEX_SIZE : 1;
       unsigned tex_z = target == PIPE_TEXTURE_3D ? TEX_Y : 0;
 
-      float texels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
-      int32_t itexels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
-      for (unsigned z = 0; z < depth; z++) {
-         for (unsigned y = 0; y < TEX_SIZE; y++) {
-            for (unsigned x = 0; x < TEX_SIZE; x++) {
-               unsigned i = ((z * TEX_SIZE + y) * TEX_SIZE + x) * 4;
-               texel_value(x, y, z, &texels[i]);
-               for (unsigned c = 0; c < 4; c++)
-                  itexels[i + c] = (int32_t)texels[i + c];
-            }
-         }
-      }
-
       struct pipe_resource ttempl = {
          .target = target,
          .format = tex_format,
          .width0 = TEX_SIZE, .height0 = TEX_SIZE, .depth0 = depth, .array_size = 1,
          .bind = PIPE_BIND_SAMPLER_VIEW,
       };
-      struct pipe_resource *tex = screen->resource_create(screen, &ttempl);
       struct pipe_box box = { .width = TEX_SIZE, .height = TEX_SIZE, .depth = depth };
-      pipe->texture_subdata(pipe, tex, 0, PIPE_MAP_WRITE, &box,
-                            tex_is_float ? (const void *)texels : (const void *)itexels,
-                            TEX_SIZE * 4 * sizeof(float),
-                            TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+      struct pipe_resource *texes[PIPE_MAX_SAMPLERS] = { 0 };
+      for (unsigned slot = 0; slot < num_tex && slot < PIPE_MAX_SAMPLERS; slot++) {
+         float texels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+         int32_t itexels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+         for (unsigned z = 0; z < depth; z++) {
+            for (unsigned y = 0; y < TEX_SIZE; y++) {
+               for (unsigned x = 0; x < TEX_SIZE; x++) {
+                  unsigned i = ((z * TEX_SIZE + y) * TEX_SIZE + x) * 4;
+                  texel_value(slot, x, y, z, &texels[i]);
+                  for (unsigned c = 0; c < 4; c++)
+                     itexels[i + c] = (int32_t)texels[i + c];
+               }
+            }
+         }
+         texes[slot] = screen->resource_create(screen, &ttempl);
+         pipe->texture_subdata(pipe, texes[slot], 0, PIPE_MAP_WRITE, &box,
+                               tex_is_float ? (const void *)texels : (const void *)itexels,
+                               TEX_SIZE * 4 * sizeof(float),
+                               TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+      }
 
       void *sampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
          .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
@@ -588,17 +597,17 @@ main(int argc, char **argv)
       void *samplers[PIPE_MAX_SAMPLERS] = { 0 };
       for (unsigned i = 0; i < num_tex && i < PIPE_MAX_SAMPLERS; i++) {
          struct pipe_sampler_view vtempl = { 0 };
-         u_sampler_view_default_template(&vtempl, tex, tex->format);
-         views[i] = pipe->create_sampler_view(pipe, tex, &vtempl);
+         u_sampler_view_default_template(&vtempl, texes[i], texes[i]->format);
+         views[i] = pipe->create_sampler_view(pipe, texes[i], &vtempl);
          samplers[i] = sampler;
       }
       pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, num_tex, 0, false, views);
       pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, num_tex, samplers);
 
       float want[4];
-      texel_value(TEX_X, TEX_Y, tex_z, want);
-      printf("air_run: %u texture%s bound: %ux%ux%u %s, texel (x,y,z) = "
-             "(100+x, 200+y, 300+x+y+z, 400), nearest, clamped\n",
+      texel_value(0, TEX_X, TEX_Y, tex_z, want);
+      printf("air_run: %u texture%s bound: %ux%ux%u %s, texel (x,y,z) of slot n = "
+             "(100+x+1000n, 200+y, 300+x+y+z, 400), nearest, clamped\n",
              num_tex, num_tex == 1 ? "" : "s", TEX_SIZE, TEX_SIZE, depth,
              util_format_short_name(tex_format));
       printf("air_run: expected %.9g %.9g %.9g %.9g  (the centre of texel %u,%u,%u sampled "
