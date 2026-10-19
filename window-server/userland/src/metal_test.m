@@ -1,0 +1,308 @@
+/*
+ * metal_test: what iOS here believes about Metal, and what it does with the answer.
+ *
+ * Nothing in iOS says a word when Metal is missing. A program asks for the system's device with
+ * MTLCreateSystemDefaultDevice(); if there is none it gets nil, with no log line, no error and no
+ * reason, and whatever the caller does next -- fall back, draw nothing, or stop at an assertion --
+ * is all that is ever seen. This prints the whole chain instead, so that a failure somewhere above
+ * can be told from a failure here.
+ *
+ * The chain is short, and every step of it is checked below:
+ *
+ *   1. Metal's MTLRegisterDevices() asks IOKit for the services of class "IOAcceleratorES" --
+ *      that name, and no other, is the whole of how a GPU is found;
+ *   2. of each such service it reads two string properties, "MetalPluginName" and
+ *      "MetalPluginClassName";
+ *   3. it loads /System/Library/Extensions/<MetalPluginName>.bundle and takes the class named by
+ *      MetalPluginClassName, or the bundle's principal class;
+ *   4. the class must be a subclass of Metal's own private _MTLDevice, or it is dropped;
+ *   5. it is sent -initWithAcceleratorPort: with the service, and that object is the device.
+ *      MTLCreateSystemDefaultDevice() hands out the one device of that list, under a dispatch_once:
+ *      an empty list is an answer given once and kept, silently, for the life of the process.
+ *
+ * So the question "is there Metal" has exactly one answer, and no capability bit anywhere stands
+ * in for it. What iOS publishes about graphics besides -- MobileGestalt's GraphicsFeatureSetClass
+ * and GraphicsFeatureSetFallbacks, from the device tree's "graphics-featureset-class" and
+ * "graphics-featureset-fallbacks" -- is read by CoreUI and CoreThemeDefinition to choose which
+ * compiled artwork to take out of an asset catalog, not by anything that decides how to draw; it
+ * is printed here to show that it says the iPhone X's "APPLE4" whether or not a device exists.
+ *
+ * The last part asks a framework that has a path without Metal whether that path works: CoreImage
+ * runs a filter kernel over four pixels and the result is read back. It is the one thing here that
+ * can answer "can this system process an image at all", which the camera and Photos both need.
+ *
+ *   usage: metal_test
+ */
+#import <CoreFoundation/CoreFoundation.h>
+#import <CoreImage/CoreImage.h>
+#import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
+#import <Metal/Metal.h>
+#import <objc/runtime.h>
+#import <stdio.h>
+
+extern CFTypeRef MGCopyAnswer(CFStringRef key);
+
+#define EXTENSIONS      "/System/Library/Extensions"
+
+/* A string property of an IOKit service, or NULL; the caller frees it. */
+static char *
+service_string(io_service_t service, const char *name)
+{
+	CFStringRef key = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	CFTypeRef value = IORegistryEntryCreateCFProperty(service, key, NULL, 0);
+	char *text = NULL;
+
+	CFRelease(key);
+	if (value != NULL) {
+		if (CFGetTypeID(value) == CFStringGetTypeID()) {
+			text = calloc(1, 256);
+			if (text != NULL && !CFStringGetCString(value, text, 256, kCFStringEncodingUTF8)) {
+				free(text);
+				text = NULL;
+			}
+		}
+		CFRelease(value);
+	}
+	return text;
+}
+
+/* Step 1 and 2: the services Metal looks for, and the two properties it reads of each. */
+static int
+accelerators(void)
+{
+	io_iterator_t it = IO_OBJECT_NULL;
+	CFMutableDictionaryRef matching = IOServiceMatching("IOAcceleratorES");
+	kern_return_t kr;
+	io_service_t service;
+	int found = 0;
+
+	if (matching == NULL) {
+		printf("metal_test: IOServiceMatching(\"IOAcceleratorES\") failed\n");
+		return 0;
+	}
+	/* IOServiceGetMatchingServices consumes the dictionary. */
+	kr = IOServiceGetMatchingServices(MACH_PORT_NULL, matching, &it);
+	if (kr != KERN_SUCCESS) {
+		printf("metal_test: IOServiceGetMatchingServices failed, %#x\n", kr);
+		return 0;
+	}
+	while ((service = IOIteratorNext(it)) != IO_OBJECT_NULL) {
+		io_name_t name = { 0 };
+		char *plugin = service_string(service, "MetalPluginName");
+		char *class_name = service_string(service, "MetalPluginClassName");
+
+		IORegistryEntryGetName(service, name);
+		printf("metal_test:   IOAcceleratorES \"%s\": MetalPluginName %s, MetalPluginClassName %s\n",
+		    name, plugin ? plugin : "(none)", class_name ? class_name : "(none)");
+		free(plugin);
+		free(class_name);
+		IOObjectRelease(service);
+		found++;
+	}
+	IOObjectRelease(it);
+	if (found == 0) {
+		printf("metal_test:   none: Metal will find no device at all\n");
+	}
+	return found;
+}
+
+/* What the registry does have that looks like a GPU, whatever its class is called. */
+static void
+gpu_services(void)
+{
+	static const char *const classes[] = { "RedwoodGPU", "IOGPU", "AGXAccelerator", "IOAccelerator" };
+	int found = 0;
+
+	for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+		CFMutableDictionaryRef matching = IOServiceMatching(classes[i]);
+		io_iterator_t it = IO_OBJECT_NULL;
+		io_service_t service;
+
+		if (matching == NULL || IOServiceGetMatchingServices(MACH_PORT_NULL, matching, &it) != KERN_SUCCESS) {
+			continue;
+		}
+		while ((service = IOIteratorNext(it)) != IO_OBJECT_NULL) {
+			io_name_t name = { 0 };
+			char *client = service_string(service, "IOUserClientClass");
+
+			IORegistryEntryGetName(service, name);
+			printf("metal_test:   %s \"%s\": IOUserClientClass %s\n", classes[i], name,
+			    client ? client : "(none)");
+			free(client);
+			IOObjectRelease(service);
+			found++;
+		}
+		IOObjectRelease(it);
+	}
+	if (found == 0) {
+		printf("metal_test:   none\n");
+	}
+}
+
+/* Steps 3 and 4: could a plug-in bundle in this image be loaded and taken for a device at all. */
+static void
+plugins(void)
+{
+	NSFileManager *files = [NSFileManager defaultManager];
+	NSArray<NSString *> *entries = [files contentsOfDirectoryAtPath:@EXTENSIONS error:NULL];
+	Class device_class = objc_getClass("_MTLDevice");
+	int bundles = 0;
+
+	printf("metal_test:   Metal's own base class _MTLDevice: %s\n", device_class ? "there" : "not there");
+	if (entries == nil) {
+		printf("metal_test:   %s is not in this image: no plug-in could be loaded\n", EXTENSIONS);
+		return;
+	}
+	for (NSString *entry in entries) {
+		if (![entry hasSuffix:@".bundle"]) {
+			continue;
+		}
+		NSString *path = [@EXTENSIONS stringByAppendingPathComponent:entry];
+		NSBundle *bundle = [NSBundle bundleWithPath:path];
+		NSString *executable = [bundle objectForInfoDictionaryKey:@"CFBundleExecutable"];
+		NSString *principal = [bundle objectForInfoDictionaryKey:@"NSPrincipalClass"];
+		Class loaded = Nil;
+		const char *verdict;
+
+		bundles++;
+		/* Taking the class is what loads the bundle's code; it is the step that fails first. */
+		loaded = principal != nil ? [bundle classNamed:principal] : [bundle principalClass];
+		if (loaded == Nil) {
+			verdict = "the class does not load";
+		} else if (device_class == Nil) {
+			verdict = "loaded, but there is no _MTLDevice to compare it with";
+		} else if ([loaded isSubclassOfClass:device_class]) {
+			verdict = "loaded, and a _MTLDevice: Metal would take it";
+		} else {
+			verdict = "loaded, but not a _MTLDevice: Metal would drop it";
+		}
+		printf("metal_test:   %s: executable %s, principal class %s -- %s\n", [entry UTF8String],
+		    executable ? [executable UTF8String] : "(none)",
+		    principal ? [principal UTF8String] : "(none)", verdict);
+	}
+	if (bundles == 0) {
+		printf("metal_test:   no .bundle in %s\n", EXTENSIONS);
+	}
+}
+
+/* Step 5, as a program sees it. */
+static void
+the_device(void)
+{
+	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+
+	if (device == nil) {
+		printf("metal_test:   MTLCreateSystemDefaultDevice() = nil (and says nothing about why)\n");
+		return;
+	}
+	printf("metal_test:   MTLCreateSystemDefaultDevice() = \"%s\", class %s\n",
+	    [[device name] UTF8String], class_getName([(id)device class]));
+	printf("metal_test:   registry id %llu, unified memory %d, max threads per group %lu, "
+	    "Apple family 1/4 %d/%d\n", (unsigned long long)[device registryID], (int)[device hasUnifiedMemory],
+	    (unsigned long)[device maxThreadsPerThreadgroup].width,
+	    (int)[device supportsFamily:MTLGPUFamilyApple1], (int)[device supportsFamily:MTLGPUFamilyApple4]);
+}
+
+/* What iOS publishes about graphics besides: artwork, not rendering (see the note above). */
+static void
+gestalt(void)
+{
+	static const char *const keys[] = {
+		"GraphicsFeatureSetClass", "GraphicsFeatureSetFallbacks", "ArtworkDeviceSubType",
+		"HasExtendedColorDisplay", "main-screen-class", "DeviceSupportsMetal",
+	};
+
+	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+		CFTypeRef answer = MGCopyAnswer(key);
+		CFStringRef text = answer ? CFCopyDescription(answer) : NULL;
+		char line[256] = "(none)";
+
+		if (text != NULL) {
+			CFStringGetCString(text, line, sizeof(line), kCFStringEncodingUTF8);
+			CFRelease(text);
+		}
+		printf("metal_test:   %s = %s\n", keys[i], line);
+		if (answer != NULL) {
+			CFRelease(answer);
+		}
+		CFRelease(key);
+	}
+}
+
+/*
+ * A framework that has a path without Metal: CoreImage. A filter kernel is run over four pixels
+ * and the result read back, which tells whether this system can process an image at all.
+ */
+static void
+coreimage(void)
+{
+	@autoreleasepool {
+		CIContext *context = [CIContext contextWithOptions:nil];
+		CIImage *source, *result;
+		CIFilter *filter;
+		CGImageRef image;
+		CGRect rect = CGRectMake(0, 0, 4, 4);
+		unsigned char pixels[4 * 4 * 4];
+		CGColorSpaceRef space;
+		CGContextRef bitmap;
+
+		if (context == nil) {
+			printf("metal_test:   no CIContext: CoreImage cannot work here\n");
+			return;
+		}
+		printf("metal_test:   CIContext: %s\n", class_getName([context class]));
+		/* orange, inverted by a kernel: 1, 0.5, 0 -> 0, 0.5, 1 */
+		source = [[CIImage imageWithColor:[CIColor colorWithRed:1.0 green:0.5 blue:0.0]]
+		    imageByCroppingToRect:rect];
+		filter = [CIFilter filterWithName:@"CIColorInvert"];
+		if (filter == nil) {
+			printf("metal_test:   no CIColorInvert filter\n");
+			return;
+		}
+		[filter setValue:source forKey:kCIInputImageKey];
+		result = [filter valueForKey:kCIOutputImageKey];
+		if (result == nil) {
+			printf("metal_test:   the filter gave no image\n");
+			return;
+		}
+		image = [context createCGImage:result fromRect:rect];
+		if (image == NULL) {
+			printf("metal_test:   CoreImage did not render: a filter kernel cannot run here\n");
+			return;
+		}
+		memset(pixels, 0, sizeof(pixels));
+		space = CGColorSpaceCreateDeviceRGB();
+		bitmap = CGBitmapContextCreate(pixels, 4, 4, 8, 4 * 4, space,
+		    kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+		if (bitmap != NULL) {
+			CGContextDrawImage(bitmap, rect, image);
+			printf("metal_test:   CoreImage rendered: first pixel %u %u %u %u (inverted orange is about 0 128 255 255)\n",
+			    pixels[0], pixels[1], pixels[2], pixels[3]);
+			CGContextRelease(bitmap);
+		} else {
+			printf("metal_test:   CoreImage rendered, but the pixels could not be read back\n");
+		}
+		CGColorSpaceRelease(space);
+		CGImageRelease(image);
+	}
+}
+
+int
+main(void)
+{
+	printf("metal_test: the services Metal looks for (IOAcceleratorES)\n");
+	accelerators();
+	printf("metal_test: what the registry has that is a GPU\n");
+	gpu_services();
+	printf("metal_test: the plug-in bundles of %s\n", EXTENSIONS);
+	plugins();
+	printf("metal_test: the device a program gets\n");
+	the_device();
+	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
+	gestalt();
+	printf("metal_test: CoreImage, which has a path without Metal\n");
+	coreimage();
+	return 0;
+}
