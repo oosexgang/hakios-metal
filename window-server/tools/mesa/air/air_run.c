@@ -45,6 +45,7 @@
 #endif
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
+#include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/u_memory.h"
 
@@ -60,6 +61,32 @@
 
 #define WIDTH 4
 #define HEIGHT 4
+
+/* The texture bound for every sampled texture the shader declares: four by
+ * four, 32-bit floats, each texel a number that says which texel it is. The
+ * sampler is nearest with no mip filter and clamped addressing, and the
+ * coordinate the vertex shader hands over is the centre of texel (1, 1), so
+ * a correct sample is an exact equality and not a tolerance -- no filtering
+ * weights, no wrap arithmetic, nothing to round.
+ *
+ * This verifies the texture operations whose sampler the API chooses (nine
+ * modules of the corpus) and those that take no sampler at all (twenty-nine,
+ * which fetch by integer coordinate). It cannot verify the two whose sampler
+ * the shader declares itself: that needs Metal's 64-bit sampler word decoded,
+ * which it is not.
+ */
+#define TEX_SIZE 4
+#define TEX_X 1
+#define TEX_Y 1
+
+static void
+texel_value(unsigned x, unsigned y, unsigned z, float out[4])
+{
+   out[0] = 100.0f + x;
+   out[1] = 200.0f + y;
+   out[2] = 300.0f + x + y + z;
+   out[3] = 400.0f;
+}
 
 #ifdef __APPLE__
 /*
@@ -132,7 +159,7 @@ pattern_byte(unsigned i)
  * its own that is a separate run.
  */
 static nir_shader *
-quad_vertex_shader(const nir_shader_compiler_options *options)
+quad_vertex_shader(const nir_shader_compiler_options *options, unsigned num_varyings)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, options, "quad");
    nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
@@ -144,8 +171,23 @@ quad_vertex_shader(const nir_shader_compiler_options *options)
    out->data.location = VARYING_SLOT_POS;
    out->data.driver_location = 0;
    nir_store_var(&b, out, nir_load_var(&b, in), 0xf);
+
+   /* One constant coordinate per varying the fragment shader reads: the
+    * centre of texel (TEX_X, TEX_Y), so every fragment samples the same
+    * texel and the expected value is a single known one.
+    */
+   float c = (TEX_X + 0.5f) / TEX_SIZE;
+   float d = (TEX_Y + 0.5f) / TEX_SIZE;
+   for (unsigned i = 0; i < num_varyings; i++) {
+      nir_variable *v = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_vec4_type(), "varying");
+      v->data.location = VARYING_SLOT_VAR0 + i;
+      v->data.driver_location = 1 + i;
+      v->data.interpolation = INTERP_MODE_SMOOTH;
+      nir_store_var(&b, v, nir_imm_vec4(&b, c, d, c, 1.0f), 0xf);
+   }
    b.shader->num_inputs = 1;
-   b.shader->num_outputs = 1;
+   b.shader->num_outputs = 1 + num_varyings;
    return b.shader;
 }
 
@@ -349,6 +391,34 @@ main(int argc, char **argv)
       return 1;
    }
 
+   /* A shader may declare a render target and never store to it:
+    * texturedFragment3DDepth returns {undef, depth} and its only real output
+    * is FRAG_RESULT_DEPTH. Reading the colour then gives the clear value,
+    * which is a number that means nothing -- worse than no number, because it
+    * looks like a result. This harness binds no depth attachment, so say so.
+    */
+   bool stores_colour = false;
+   nir_foreach_function_impl(impl, fs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_deref_instr *d = nir_src_as_deref(intr->src[0]);
+            if (d && d->deref_type == nir_deref_type_var &&
+                d->var->data.location == (int)(FRAG_RESULT_DATA0 + read_rt))
+               stores_colour = true;
+         }
+      }
+   }
+   if (!stores_colour) {
+      fprintf(stderr, "air_run: %s stores nothing to a colour attachment -- its output is "
+                      "depth or stencil, which this harness does not read back\n", name);
+      return 1;
+   }
+
    finalize_for_gallium(fs);
 
    struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
@@ -424,6 +494,118 @@ main(int argc, char **argv)
       free(bits);
    }
 
+   /* every sampled texture the shader declares, and a sampler for it */
+   unsigned num_tex = 0;
+   for (unsigned i = 0; i < info.num_resources; i++)
+      if (info.resources[i].kind == AIR_RESOURCE_TEXTURE)
+         num_tex = MAX2(num_tex, info.resources[i].index + 1);
+   if (num_tex) {
+      /* The texture's format follows what the shader samples into: a Metal
+       * texture2d<uint> read out of a float texture gives numbers that are
+       * neither right nor obviously wrong.
+       */
+      enum pipe_format tex_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      bool tex_is_float = true;
+      /* and the target, which has to match too: a 3D sample from a 2D
+       * texture can come back right by accident, which is not evidence
+       */
+      enum pipe_texture_target target = PIPE_TEXTURE_2D;
+      enum glsl_sampler_dim dim = GLSL_SAMPLER_DIM_2D;
+      nir_foreach_function_impl(impl, fs) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_tex)
+                  continue;
+               nir_tex_instr *t = nir_instr_as_tex(instr);
+               nir_alu_type base = nir_alu_type_get_base_type(t->dest_type);
+               if (base == nir_type_int) {
+                  tex_format = PIPE_FORMAT_R32G32B32A32_SINT;
+                  tex_is_float = false;
+               } else if (base == nir_type_uint) {
+                  tex_format = PIPE_FORMAT_R32G32B32A32_UINT;
+                  tex_is_float = false;
+               }
+               dim = t->sampler_dim;
+               if (dim == GLSL_SAMPLER_DIM_3D)
+                  target = PIPE_TEXTURE_3D;
+               else if (dim == GLSL_SAMPLER_DIM_MS)
+                  target = PIPE_TEXTURE_2D;   /* refused below */
+               goto have_format;
+            }
+         }
+      }
+   have_format:;
+      if (dim == GLSL_SAMPLER_DIM_MS) {
+         fprintf(stderr, "air_run: %s samples a multisample texture; this harness binds "
+                         "none, so it is not run rather than run against the wrong thing\n",
+                 name);
+         return 1;
+      }
+      if (dim != GLSL_SAMPLER_DIM_2D && dim != GLSL_SAMPLER_DIM_3D) {
+         fprintf(stderr, "air_run: %s samples a texture of a kind this harness does not "
+                         "bind (dim %u)\n", name, dim);
+         return 1;
+      }
+      unsigned depth = target == PIPE_TEXTURE_3D ? TEX_SIZE : 1;
+      unsigned tex_z = target == PIPE_TEXTURE_3D ? TEX_Y : 0;
+
+      float texels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+      int32_t itexels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+      for (unsigned z = 0; z < depth; z++) {
+         for (unsigned y = 0; y < TEX_SIZE; y++) {
+            for (unsigned x = 0; x < TEX_SIZE; x++) {
+               unsigned i = ((z * TEX_SIZE + y) * TEX_SIZE + x) * 4;
+               texel_value(x, y, z, &texels[i]);
+               for (unsigned c = 0; c < 4; c++)
+                  itexels[i + c] = (int32_t)texels[i + c];
+            }
+         }
+      }
+
+      struct pipe_resource ttempl = {
+         .target = target,
+         .format = tex_format,
+         .width0 = TEX_SIZE, .height0 = TEX_SIZE, .depth0 = depth, .array_size = 1,
+         .bind = PIPE_BIND_SAMPLER_VIEW,
+      };
+      struct pipe_resource *tex = screen->resource_create(screen, &ttempl);
+      struct pipe_box box = { .width = TEX_SIZE, .height = TEX_SIZE, .depth = depth };
+      pipe->texture_subdata(pipe, tex, 0, PIPE_MAP_WRITE, &box,
+                            tex_is_float ? (const void *)texels : (const void *)itexels,
+                            TEX_SIZE * 4 * sizeof(float),
+                            TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+
+      void *sampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
+         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      });
+
+      struct pipe_sampler_view *views[PIPE_MAX_SHADER_SAMPLER_VIEWS] = { 0 };
+      void *samplers[PIPE_MAX_SAMPLERS] = { 0 };
+      for (unsigned i = 0; i < num_tex && i < PIPE_MAX_SAMPLERS; i++) {
+         struct pipe_sampler_view vtempl = { 0 };
+         u_sampler_view_default_template(&vtempl, tex, tex->format);
+         views[i] = pipe->create_sampler_view(pipe, tex, &vtempl);
+         samplers[i] = sampler;
+      }
+      pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, num_tex, 0, false, views);
+      pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, num_tex, samplers);
+
+      float want[4];
+      texel_value(TEX_X, TEX_Y, tex_z, want);
+      printf("air_run: %u texture%s bound: %ux%ux%u %s, texel (x,y,z) = "
+             "(100+x, 200+y, 300+x+y+z, 400), nearest, clamped\n",
+             num_tex, num_tex == 1 ? "" : "s", TEX_SIZE, TEX_SIZE, depth,
+             util_format_short_name(tex_format));
+      printf("air_run: expected %.9g %.9g %.9g %.9g  (the centre of texel %u,%u,%u sampled "
+             "once)\n", (double)want[0], (double)want[1], (double)want[2], (double)want[3],
+             TEX_X, TEX_Y, tex_z);
+   }
+
    /* the quad */
    static const float verts[] = {
       -1, -1, 0, 1,   1, -1, 0, 1,   -1, 1, 0, 1,   1, 1, 0, 1,
@@ -441,7 +623,7 @@ main(int argc, char **argv)
       });
    pipe->bind_vertex_elements_state(pipe, velem);
 
-   nir_shader *vs = quad_vertex_shader(options);
+   nir_shader *vs = quad_vertex_shader(options, info.num_varyings);
    finalize_for_gallium(vs);
    void *vs_cso = pipe->create_vs_state(pipe, &(struct pipe_shader_state){
       .type = PIPE_SHADER_IR_NIR, .ir.nir = vs,
