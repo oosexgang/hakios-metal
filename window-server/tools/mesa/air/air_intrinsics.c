@@ -133,7 +133,35 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_tan") || !strcmp(op, "tan")) {
       r = nir_fdiv(&c->b, nir_fsin(&c->b, a[0]), nir_fcos(&c->b, a[0]));
    } else if (!strcmp(op, "fast_atan2") || !strcmp(op, "atan2")) {
-      r = nir_atan2(&c->b, a[0], a[1]);
+      /* Mesa's nir_atan2 is right everywhere but the origin, where its own
+       * comment says it deliberately pretends 0/0 = 1 because GLSL licenses an
+       * implementation to deviate from IEEE at (0, 0). That gives
+       * atan2(0, 0) = 3*pi/4. Metal's atan2 is OpenCL's, which keeps the IEEE
+       * values:
+       *
+       *    atan2(+-0, x > 0) = +-0        atan2(+-0, +0) = +-0
+       *    atan2(+-0, x < 0) = +-pi       atan2(+-0, -0) = +-pi
+       *
+       * so a shader taking the angle of a vector that happens to be zero gets
+       * 135 degrees instead of 0. That is not a precision deviation of the
+       * kind the fast_ prefix allows, so the origin is handled here and the
+       * rest left to Mesa.
+       *
+       * The sign of a zero cannot be had from a float comparison -- -0 == 0 --
+       * so the sign bit is read as an integer. A NIR value is a bit vector and
+       * ilt reinterprets it; nir_atan2 avoids this only to match the GLSL
+       * front-end, which is not a constraint here.
+       */
+      nir_def *y = a[0], *x = a[1];
+      nir_def *origin = nir_iand(&c->b, nir_feq_imm(&c->b, y, 0.0),
+                                 nir_feq_imm(&c->b, x, 0.0));
+      nir_def *mag = nir_fmul_imm(&c->b,
+                                  nir_b2fN(&c->b, nir_ilt_imm(&c->b, x, 0),
+                                           y->bit_size),
+                                  M_PI);
+      nir_def *at_origin =
+         nir_bcsel(&c->b, nir_ilt_imm(&c->b, y, 0), nir_fneg(&c->b, mag), mag);
+      r = nir_bcsel(&c->b, origin, at_origin, nir_atan2(&c->b, y, x));
    } else if (!strcmp(op, "fast_exp") || !strcmp(op, "exp")) {
       /* the natural one: Apple's compiler names exp and exp2 separately */
       r = nir_fexp2(&c->b, nir_fmul_imm(&c->b, a[0], M_LOG2E));
