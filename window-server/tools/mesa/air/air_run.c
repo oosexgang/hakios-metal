@@ -172,8 +172,22 @@ finalize_for_gallium(nir_shader *nir)
 int
 main(int argc, char **argv)
 {
+   /* --disasm: ask ir3 to print the Adreno instructions it generates. The
+    * screen's name proves fd_screen_create won; it does not prove that the
+    * shader itself went through ir3 rather than some later software path, and
+    * the four floats look identical either way. ir3's own disassembly in the
+    * log is the positive proof. IR3_SHADER_DEBUG is read once, at compiler
+    * creation, so it has to be set before the screen is made.
+    */
+   bool want_disasm = false;
+   if (argc > 1 && !strcmp(argv[1], "--disasm")) {
+      want_disasm = true;
+      setenv("IR3_SHADER_DEBUG", "disasm", 1);
+      argv++;
+      argc--;
+   }
    if (argc < 2) {
-      fprintf(stderr, "usage: air_run FILE[.metallib] [FUNCTION]\n");
+      fprintf(stderr, "usage: air_run [--disasm] FILE[.metallib] [FUNCTION]\n");
       return 2;
    }
 
@@ -232,6 +246,7 @@ main(int argc, char **argv)
     * AIR_RUN_SOFTWARE=1 forces software even where a GPU is present.
     */
    struct pipe_screen *screen = NULL;
+   const char *how = "software";
 #ifdef GALLIUM_FREEDRENO
    if (!debug_get_bool_option("AIR_RUN_SOFTWARE", false)) {
       int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
@@ -256,7 +271,9 @@ main(int argc, char **argv)
          config.options_info = &info;
 
          screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
-         if (!screen)
+         if (screen)
+            how = "the GPU, through the kernel's msm device";
+         else
             fprintf(stderr, "air_run: the msm device opened but gave no screen\n");
       }
    }
@@ -267,7 +284,7 @@ main(int argc, char **argv)
       fprintf(stderr, "air_run: no gallium screen\n");
       return 1;
    }
-   printf("air_run: %s on %s\n", name, screen->get_name(screen));
+   printf("air_run: %s on %s (%s)\n", name, screen->get_name(screen), how);
 
    const void *options =
       screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_FRAGMENT);
@@ -455,6 +472,13 @@ main(int argc, char **argv)
       fprintf(stderr, "air_run: the render target could not be read back\n");
       return 1;
    }
+   /* Named again here, beside the numbers: the line at the top says which
+    * screen was created, this one says which screen the pixel just came out
+    * of. Neither is proof that no stage in between went software -- --disasm
+    * is, by making ir3 print what it compiled.
+    */
+   printf("air_run: read back from %s (%s)%s\n", screen->get_name(screen), how,
+          want_disasm ? ", ir3's instructions are above" : "");
    printf("air_run: the pixel at (0, 0) of render target %u came back as:\n",
           read_rt);
    for (unsigned c = 0; c < 4; c++) {
