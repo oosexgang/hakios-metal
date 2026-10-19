@@ -193,7 +193,7 @@ dimensions -- and hides on the rest, which is presumably why it survived.
      idep_vtn,
      idep_mesautil,
    ],
-@@ -318,6 +319,21 @@
+@@ -318,6 +319,22 @@
    install : false,
  )
  
@@ -204,10 +204,11 @@ dimensions -- and hides on the rest, which is presumably why it survived.
 +  'air_run',
 +  files('../../../compiler/air/air_run.c'),
 +  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
-+                         inc_gallium_aux, inc_gallium_winsys_sw,
++                         inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
 +                         include_directories('../../drivers')],
-+  dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe],
-+  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_freedreno,
++                  dep_libdrm],
++  link_with : [libgallium, libgalliumvl_stub, libws_null, libfreedrenowinsys],
 +  build_by_default : false,
 +  install : false,
 +)

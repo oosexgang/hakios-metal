@@ -37,14 +37,23 @@
 #include "pipe/p_state.h"
 #include "target-helpers/inline_sw_helper.h"
 #include "null/null_sw_winsys.h"
+#ifdef GALLIUM_FREEDRENO
+#include "freedreno/drm/freedreno_drm_public.h"
+#include <xf86drm.h>
+#endif
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
+#include "util/u_debug.h"
 #include "util/u_memory.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #include <signal.h>
-#include <ucontext.h>
+/* <sys/ucontext.h>, not <ucontext.h>: the latter refuses to be included
+ * without _XOPEN_SOURCE on the iOS SDK, and userland/src/inject.c takes the
+ * same route for the same reason.
+ */
+#include <sys/ucontext.h>
 #endif
 
 #define WIDTH 4
@@ -213,13 +222,27 @@ main(int argc, char **argv)
       name = lib.functions[pick].name;
    }
 
-   /* The screen. Here it is softpipe, drawing into memory with no GPU at all,
-    * which is the point: the whole path can be checked on this machine. On the
-    * phone it is the freedreno screen that the port's Mesa already makes
-    * (osmesa_create_gpu_screen in tools/mesa/freedreno-darwin.patch), and
-    * nothing below this line changes.
+   /* The screen: the GPU's where the kernel has one to drive, softpipe
+    * otherwise. The same source therefore runs on this machine (no msm
+    * device, so it falls back and draws in software) and on the phone, where
+    * it opens the Adreno exactly as the port's own Mesa does
+    * (osmesa_create_gpu_screen in tools/mesa/freedreno-darwin.patch).
+    * AIR_RUN_SOFTWARE=1 forces software even where a GPU is present.
     */
-   struct pipe_screen *screen = sw_screen_create(null_sw_create());
+   struct pipe_screen *screen = NULL;
+#ifdef GALLIUM_FREEDRENO
+   if (!debug_get_bool_option("AIR_RUN_SOFTWARE", false)) {
+      int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
+      if (fd >= 0) {
+         static struct pipe_screen_config config;
+         screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
+         if (!screen)
+            fprintf(stderr, "air_run: the msm device opened but gave no screen\n");
+      }
+   }
+#endif
+   if (!screen)
+      screen = sw_screen_create(null_sw_create());
    if (!screen) {
       fprintf(stderr, "air_run: no gallium screen\n");
       return 1;
