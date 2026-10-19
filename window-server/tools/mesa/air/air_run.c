@@ -269,14 +269,15 @@ finalize_for_gallium(nir_shader *nir)
  *     pattern), so a thread reading the wrong offset produces a wrong value
  *     and not a plausible one.
  *
- * What this does NOT yet do is give atomics a test that can fail. Seventeen of
- * the forty kernels that translate use a global atomic, and a sum written by
+ * A kernel of Apple's that uses atomics and produces sensible numbers here is
+ * evidence that it ran and no evidence about atomicity: a sum written by
  * threads that never raced looks exactly like a sum written by threads that
- * did. Detecting a lost update needs the expected total to depend on every
- * thread having contributed -- which needs a kernel whose arithmetic is known,
- * i.e. one written for the purpose rather than one of Apple's. Until that
- * exists, a kernel that uses atomics and produces sensible numbers here is
- * evidence that it ran, and no evidence at all about atomicity.
+ * did. The kernel that can tell them apart is written for the purpose rather
+ * than Apple's -- tools/air/atomiccheck.py, which makes each thread report the
+ * value its own fetch_add returned, so the sixteen of them must be 0..15 with
+ * nothing repeated whatever order the threads ran in. Even that is only
+ * evidence of atomicity where the threads really do run at once, which here
+ * they need not.
  */
 #define GRID 4
 
