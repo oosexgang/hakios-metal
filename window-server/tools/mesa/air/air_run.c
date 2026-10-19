@@ -218,6 +218,156 @@ finalize_for_gallium(nir_shader *nir)
             type_size_vec4, 0);
 }
 
+/* -- compute ---------------------------------------------------------------
+ *
+ * A kernel writes through pointers instead of returning anything, so what is
+ * read back is a device buffer. Two rules decide whether that readback is
+ * evidence, and both come from the same mistake made three times with
+ * textures: a test can pass for the wrong reason, and the way to stop it is
+ * to make every input distinguishable so any confusion gives a wrong number
+ * rather than the right one.
+ *
+ *   - the grid is more than one thread, and every element of the output is
+ *     printed, not just the first. With one thread, or one element looked at,
+ *     a wrong workgroup index or a wrong global id reads correct.
+ *   - the input buffers vary with position (the same (i * 7 + 13) & 0xff
+ *     pattern), so a thread reading the wrong offset produces a wrong value
+ *     and not a plausible one.
+ *
+ * What this does NOT yet do is give atomics a test that can fail. Seventeen of
+ * the forty kernels that translate use a global atomic, and a sum written by
+ * threads that never raced looks exactly like a sum written by threads that
+ * did. Detecting a lost update needs the expected total to depend on every
+ * thread having contributed -- which needs a kernel whose arithmetic is known,
+ * i.e. one written for the purpose rather than one of Apple's. Until that
+ * exists, a kernel that uses atomics and produces sensible numbers here is
+ * evidence that it ran, and no evidence at all about atomicity.
+ */
+#define GRID 4
+
+static int
+dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
+                nir_shader *cs, const char *name, const char *how)
+{
+   /* Metal's threadgroup size is a dispatch argument, not a shader constant,
+    * so the frontend leaves it variable (docs/air.md section 7.4) and whoever
+    * dispatches has to fix it. air_run is that whoever. It is not optional:
+    * softpipe reads the block size from TGSI_PROPERTY_CS_FIXED_BLOCK_*, and
+    * with a variable size those are zero, so it runs ZERO threads and the
+    * output buffer comes back exactly as it went in. That looked like a
+    * kernel that did nothing, and was only visible because the buffer was
+    * filled with a distinctive pattern -- had it been zeroed, a kernel named
+    * InitMinMax writing zeros would have been indistinguishable from this.
+    */
+   cs->info.workgroup_size[0] = GRID;
+   cs->info.workgroup_size[1] = GRID;
+   cs->info.workgroup_size[2] = 1;
+   cs->info.workgroup_size_variable = false;
+
+   finalize_for_gallium(cs);
+   struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
+   if (!pipe) {
+      fprintf(stderr, "air_run: no context for a kernel\n");
+      return 1;
+   }
+   printf("air_run: %s on %s (%s), as a compute kernel\n", name,
+          screen->get_name(screen), how);
+
+   /* every buffer the kernel declares; the device ones are what it writes */
+   struct pipe_resource *bufs[32] = { 0 };
+   unsigned sizes[32] = { 0 };
+   bool writable[32] = { false };
+   unsigned num_ssbo = 0, num_written = 0;
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      const struct air_resource *r = &info->resources[i];
+      unsigned bytes = r->size ? r->size : 4096;
+      if (r->index >= ARRAY_SIZE(bufs))
+         continue;
+      uint8_t *bits = calloc(1, bytes);
+      for (unsigned k = 0; k < bytes; k++)
+         bits[k] = pattern_byte(k);
+
+      if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER) {
+         struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
+                                                      PIPE_USAGE_DEFAULT, bytes);
+         pipe_buffer_write(pipe, b, 0, bytes, bits);
+         pipe->set_constant_buffer(pipe, PIPE_SHADER_COMPUTE, r->index, false,
+                                   &(struct pipe_constant_buffer){
+                                      .buffer = b, .buffer_size = bytes });
+      } else if (r->kind == AIR_RESOURCE_DEVICE_BUFFER) {
+         bufs[r->index] = pipe_buffer_create(screen, PIPE_BIND_SHADER_BUFFER,
+                                             PIPE_USAGE_STAGING, bytes);
+         pipe_buffer_write(pipe, bufs[r->index], 0, bytes, bits);
+         sizes[r->index] = bytes;
+         writable[r->index] = r->write;
+         num_ssbo = MAX2(num_ssbo, r->index + 1);
+         num_written += r->write ? 1 : 0;
+      } else if (r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_IMAGE) {
+         free(bits);
+         fprintf(stderr, "air_run: %s uses a texture or an image; this harness binds those "
+                         "for a draw and not yet for a dispatch\n", name);
+         return 1;
+      }
+      free(bits);
+   }
+   if (!num_written) {
+      fprintf(stderr, "air_run: %s writes no device buffer, so a dispatch would leave "
+                      "nothing to read back\n", name);
+      return 1;
+   }
+
+   struct pipe_shader_buffer sb[32] = { 0 };
+   unsigned mask = 0;
+   for (unsigned i = 0; i < num_ssbo; i++) {
+      sb[i].buffer = bufs[i];
+      sb[i].buffer_size = sizes[i];
+      if (writable[i])
+         mask |= 1u << i;
+   }
+   pipe->set_shader_buffers(pipe, PIPE_SHADER_COMPUTE, 0, num_ssbo, sb, mask);
+
+   void *cso = pipe->create_compute_state(pipe, &(struct pipe_compute_state){
+      .ir_type = PIPE_SHADER_IR_NIR, .prog = cs,
+      .static_shared_mem = cs->info.shared_size });
+   if (!cso) {
+      fprintf(stderr, "air_run: the driver would not make a compute state of it\n");
+      return 1;
+   }
+   pipe->bind_compute_state(pipe, cso);
+
+   /* more than one thread, and the whole grid, so that a wrong index shows */
+   struct pipe_grid_info grid = {
+      .work_dim = 3,
+      .block = { GRID, GRID, 1 },
+      .grid = { 1, 1, 1 },
+   };
+   printf("air_run: dispatching %ux%ux1 threads in one workgroup; %u device buffer%s bound, "
+          "%u of them written, filled with (i * 7 + 13) & 0xff\n",
+          GRID, GRID, num_ssbo, num_ssbo == 1 ? "" : "s", num_written);
+   pipe->launch_grid(pipe, &grid);
+   pipe->flush(pipe, NULL, 0);
+
+   for (unsigned i = 0; i < num_ssbo; i++) {
+      if (!writable[i])
+         continue;
+      struct pipe_transfer *xfer;
+      uint32_t *p = pipe_buffer_map(pipe, bufs[i], PIPE_MAP_READ, &xfer);
+      if (!p) {
+         fprintf(stderr, "air_run: device buffer %u could not be read back\n", i);
+         return 1;
+      }
+      unsigned words = MIN2(sizes[i] / 4, (unsigned)(GRID * GRID));
+      printf("air_run: device buffer %u after the dispatch, first %u words:\n", i, words);
+      for (unsigned w = 0; w < words; w++)
+         printf("  [%2u] %11u  0x%08x\n", w, p[w], p[w]);
+      pipe_buffer_unmap(pipe, xfer);
+   }
+
+   pipe->destroy(pipe);
+   screen->destroy(screen);
+   return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -354,6 +504,8 @@ main(int argc, char **argv)
       fprintf(stderr, "air_run: %s: %s\n", name, err);
       return 1;
    }
+   if (info.stage == MESA_SHADER_COMPUTE)
+      return dispatch_kernel(screen, &info, fs, name, how);
    if (info.stage != MESA_SHADER_FRAGMENT) {
       fprintf(stderr, "air_run: %s is a %s shader; only fragment shaders are drawn here\n",
               name, gl_shader_stage_name(info.stage));
