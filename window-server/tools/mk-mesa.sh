@@ -46,6 +46,11 @@ fi
 # ours, kept in the repository: always the current ones
 rm -rf mesa-$VERSION/src/redwood-drm
 cp -r "$ROOT/tools/mesa/redwood-drm" mesa-$VERSION/src/redwood-drm
+# the AIR frontend (docs/air.md): the Metal runtime will call it in this
+# library's own process, and tools/mesa/air-frontend.patch is the meson that
+# reaches it. Copied rather than linked, because this tree is cross-built.
+rm -rf mesa-$VERSION/src/compiler/air
+cp -r "$ROOT/tools/mesa/air" mesa-$VERSION/src/compiler/air
 if [ ! -x venv/bin/python3 ]; then
 	python3 -m venv venv
 	venv/bin/pip -q install mako pyyaml packaging
@@ -83,6 +88,14 @@ BUILD=build-${DRIVERS//,/-}
 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
 ninja -C $BUILD > ninja.log
+# air_run draws with a translated Metal shader and reads the pixels back; it is
+# the only way to find out whether the Adreno takes work that did not come from
+# the window server. Built only when asked, since it is a test program.
+if [ "${AIR:-}" = 1 ]; then
+	ninja -C $BUILD src/gallium/drivers/freedreno/air_run >> ninja.log
+	cp $BUILD/src/gallium/drivers/freedreno/air_run out/air_run
+	echo "mk-mesa.sh: $B/out/air_run ($(stat -c %s out/air_run) bytes)"
+fi
 
 llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
 install_name_tool -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
