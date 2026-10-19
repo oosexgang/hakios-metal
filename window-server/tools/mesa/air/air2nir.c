@@ -26,7 +26,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <inttypes.h>
+
 #include "nir.h"
+#include "nir_builder.h"
 #include "nir_air.h"
 #include "air_module.h"
 #include "util/ralloc.h"
@@ -102,6 +105,174 @@ stage_name(int stage)
    }
 }
 
+/* -- evaluating a shader by folding it -------------------------------------
+ *
+ * For the class of shader that only reads buffers and computes -- 256 of the
+ * corpus's 271 fragment shaders -- the whole thing folds to constants once the
+ * buffer loads are replaced by the bytes actually in the buffers. No
+ * interpreter is needed: NIR's own constant folding is the interpreter, and
+ * what comes out can be compared against LLVM's answer for the same bytes
+ * (tools/air/cpuref.py). This is the check docs/air.md section 4 calls the
+ * strongest one, and it needs no GPU.
+ */
+
+/* the same pattern cpuref.py fills its buffers with */
+static uint8_t
+pattern_byte(unsigned i)
+{
+   return (i * 7 + 13) & 0xff;
+}
+
+struct eval_state {
+   struct air_shader_info *info;
+   bool folded_a_load;
+};
+
+static bool
+fold_buffer_loads(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct eval_state *st = data;
+   if (intr->intrinsic != nir_intrinsic_load_ubo && intr->intrinsic != nir_intrinsic_load_ssbo)
+      return false;
+
+   unsigned isrc = 0, osrc = 1;
+   if (!nir_src_is_const(intr->src[isrc]) || !nir_src_is_const(intr->src[osrc]))
+      return false;
+   unsigned index = nir_src_as_uint(intr->src[isrc]);
+   unsigned offset = nir_src_as_uint(intr->src[osrc]);
+
+   /* only a buffer the interface actually declared, and only within its size */
+   unsigned size = 0;
+   bool found = false;
+   for (unsigned i = 0; i < st->info->num_resources; i++) {
+      const struct air_resource *r = &st->info->resources[i];
+      bool want = intr->intrinsic == nir_intrinsic_load_ubo
+                     ? r->kind == AIR_RESOURCE_CONSTANT_BUFFER
+                     : r->kind == AIR_RESOURCE_DEVICE_BUFFER;
+      if (want && r->index == index) {
+         size = r->size ? r->size : 256;
+         found = true;
+         break;
+      }
+   }
+   if (!found)
+      return false;
+
+   unsigned bytes = intr->def.num_components * intr->def.bit_size / 8;
+   if (offset + bytes > size)
+      return false;
+
+   nir_const_value v[NIR_MAX_VEC_COMPONENTS] = { 0 };
+   for (unsigned c = 0; c < intr->def.num_components; c++) {
+      uint64_t bits = 0;
+      unsigned nb = intr->def.bit_size / 8;
+      for (unsigned k = 0; k < nb; k++)
+         bits |= (uint64_t)pattern_byte(offset + c * nb + k) << (8 * k);
+      v[c].u64 = bits;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *imm = nir_build_imm(b, intr->def.num_components, intr->def.bit_size, v);
+   nir_def_replace(&intr->def, imm);
+   st->folded_a_load = true;
+   return true;
+}
+
+/* print one stored output value, if it folded to a constant */
+static void
+print_output(nir_variable *var, nir_def *value)
+{
+   printf("  %-24s ", var->name ? var->name : "?");
+   if (!nir_src_is_const(nir_src_for_ssa(value))) {
+      printf("did not fold to a constant\n");
+      return;
+   }
+   const struct glsl_type *t = glsl_without_array(var->type);
+   bool is_float = glsl_get_base_type(t) == GLSL_TYPE_FLOAT ||
+                   glsl_get_base_type(t) == GLSL_TYPE_FLOAT16;
+   for (unsigned c = 0; c < value->num_components; c++) {
+      uint64_t bits = nir_src_comp_as_uint(nir_src_for_ssa(value), c);
+      if (is_float && value->bit_size == 32) {
+         float f;
+         uint32_t u = bits;
+         memcpy(&f, &u, 4);
+         printf("%s%.9g", c ? " " : "", (double)f);
+      } else if (is_float && value->bit_size == 16) {
+         printf("%s0x%04" PRIx64, c ? " " : "", bits);
+      } else {
+         printf("%s%" PRIu64, c ? " " : "", bits);
+      }
+   }
+   printf("\n");
+}
+
+static int
+eval_module(const struct module_ref *mod)
+{
+   void *ctx = ralloc_context(NULL);
+   const char *err = NULL;
+   struct air_constant_value *fc;
+   unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc };
+   struct air_shader_info info;
+   nir_shader *nir = air_to_nir(ctx, mod->bitcode, mod->size, NULL, &options,
+                                &default_options, &info, &err);
+   if (!nir) {
+      fprintf(stderr, "air2nir: %s: %s\n", mod->name, err);
+      ralloc_free(ctx);
+      return 1;
+   }
+
+   printf("eval: %s (%s), buffers filled with (i * 7 + 13) & 0xff\n", info.entry_point,
+          gl_shader_stage_name(info.stage));
+   for (unsigned i = 0; i < info.num_resources; i++) {
+      const struct air_resource *r = &info.resources[i];
+      if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER || r->kind == AIR_RESOURCE_DEVICE_BUFFER)
+         printf("  %s buffer at index %u, %u bytes\n",
+                r->kind == AIR_RESOURCE_CONSTANT_BUFFER ? "constant" : "device",
+                r->index, r->size);
+   }
+
+   struct eval_state st = { .info = &info };
+   nir_shader_intrinsics_pass(nir, fold_buffer_loads, nir_metadata_control_flow, &st);
+
+   /* fold what the loads made foldable, and nothing else: no algebraic
+    * rewriting, so the arithmetic is IEEE and comparable with LLVM's
+    */
+   bool progress;
+   unsigned rounds = 0;
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+   } while (progress && ++rounds < 16);
+
+   printf("eval: the outputs this shader stores:\n");
+   unsigned printed = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (!deref || deref->deref_type != nir_deref_type_var)
+               continue;
+            print_output(deref->var, intr->src[1].ssa);
+            printed++;
+         }
+      }
+   }
+   if (!printed)
+      printf("  (none: every store was removed, or none folded)\n");
+   ralloc_free(ctx);
+   return 0;
+}
+
 static void
 one_line(const char *s, FILE *fp)
 {
@@ -170,7 +341,7 @@ report_one(const struct module_ref *mod)
 int
 main(int argc, char **argv)
 {
-   enum { TRANSLATE, LL, LIST, REPORT } mode = TRANSLATE;
+   enum { TRANSLATE, LL, LIST, REPORT, EVAL } mode = TRANSLATE;
    int i = 1;
    if (i < argc && !strcmp(argv[i], "--ll"))
       mode = LL, i++;
@@ -178,8 +349,11 @@ main(int argc, char **argv)
       mode = LIST, i++;
    else if (i < argc && !strcmp(argv[i], "--report"))
       mode = REPORT, i++;
+   else if (i < argc && !strcmp(argv[i], "--eval"))
+      mode = EVAL, i++;
    if (i >= argc) {
-      fprintf(stderr, "usage: air2nir [--ll | --list | --report] FILE [FUNCTION]\n");
+      fprintf(stderr,
+              "usage: air2nir [--ll | --list | --report | --eval] FILE [FUNCTION]\n");
       return 2;
    }
 
@@ -221,6 +395,10 @@ main(int argc, char **argv)
 
    for (unsigned k = 0; k < n; k++) {
       const char *err = NULL;
+      if (mode == EVAL) {
+         status |= eval_module(&mods[k]);
+         continue;
+      }
       if (mode == LIST) {
          printf("%-60s %-12s %zu\n", mods[k].name,
                 air_metallib_type_name(mods[k].container_type), mods[k].size);
