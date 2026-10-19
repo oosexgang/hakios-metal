@@ -35,6 +35,11 @@ idep_air = declare_dependency(
   include_directories : include_directories('.'),
 )
 
+# air_run (air_run.c) draws with a translated shader and reads the pixels back,
+# so it needs libgallium -- which meson has not defined yet when this file is
+# read. Its executable is declared in src/gallium/drivers/freedreno instead,
+# by tools/mesa/air-ir3.patch, next to ir3_compiler.
+
 air2nir = executable(
   'air2nir',
   files('air2nir.c'),

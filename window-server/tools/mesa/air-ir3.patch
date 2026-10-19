@@ -10,6 +10,10 @@ shows against AIR as it does against the others.
 redwood's Adreno 7c+ Gen 3 (A635) has no gpu-id of its own: freedreno knows it
 only as chip_id 0x007506030500.
 
+It also declares air_run here, next to ir3_compiler: air_run draws with a translated shader and
+reads the pixel back, and it needs libgallium, which meson has not defined yet where the rest of
+the frontend is read (src/compiler comes before src/gallium). Its source stays with the frontend.
+
 Also removes this tool's own call of ir3_nir_lower_variant, which is a bug of
 the tool: ir3_context_init already calls it on its clone of the NIR, and the
 const-state setup inside asserts the second time. It shows on any shader whose
@@ -189,3 +193,25 @@ dimensions -- and hides on the rest, which is presumably why it survived.
      idep_vtn,
      idep_mesautil,
    ],
+@@ -318,6 +319,21 @@
+   install : false,
+ )
+ 
++# air_run: draw with a Metal shader and read the pixels back. It lives here,
++# beside ir3_compiler, because this is where libgallium exists; its source is
++# with the rest of the frontend in src/compiler/air.
++air_run = executable(
++  'air_run',
++  files('../../../compiler/air/air_run.c'),
++  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
++                         inc_gallium_aux, inc_gallium_winsys_sw,
++                         include_directories('../../drivers')],
++  dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe],
++  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  build_by_default : false,
++  install : false,
++)
++
+ gmemtool = executable(
+   'gmemtool',
+   [
