@@ -38,10 +38,25 @@ air.convert.f.{f32,v2f32,v3f32}.{u,s}.* disagree with C on exactly the inputs
 that need rounding -- 5 declarations, and i2f truncates just as u2f does. Two
 unrelated front ends reaching the same instruction return the same wrong number.
 
-The case for this change is the destinations where a rounding mode is REQUIRED:
-integer to float, where IEEE-754, GLSL and OpenCL all specify
-round-to-nearest-even, and which the measurements above cover. It is deliberately
-not argued from the rest of the branch.
+The case for this change does not need a standard quoted at it, because Mesa
+already contains both answers. NIR's own constant folder, with no rounding mode
+declared, rounds to nearest even: nir_opcodes.py generates, for the plain f2f16,
+
+    if (nir_is_rounding_mode_rtz(execution_mode, 16))
+       dst = _mesa_half_to_float(_mesa_float_to_float16_rtz(src0));
+    else
+       dst = _mesa_half_to_float(_mesa_float_to_float16_rtne(src0));
+
+-- RTZ only where RTZ was asked for, RTNE otherwise -- and it folds an integer
+to float conversion through the host's own, which is also RTNE. The backend, in
+the same circumstances, leaves the cov field at ROUND_ZERO and truncates.
+
+So one expression has two answers in one compiler depending on whether NIR could
+fold it. That is what the measurements above are: the same operation over the
+same inputs, folded by NIR and executed by the hardware, disagreeing. Whatever
+any specification requires, these two should not differ from each other, and
+making the backend ask for what the folder already assumes is the smaller change
+of the two.
 
 Not verified: whether the field is honoured for a 16-bit destination. The branch
 covers TYPE_F16 too, and the measurements do not reach it -- this port's harness
