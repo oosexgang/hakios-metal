@@ -94,8 +94,11 @@ has already addressed. (ROUND_ZERO = 0 in instr-a3xx.h was verified in the pin
 and in 26.2.5; only ir3_compiler_nir.c was taken from main, so that header is
 not claimed for it.)
 
-The hunk applies cleanly to main's own copy of the file, tested with
-patch --dry-run against it rather than against the pin, so it needs no rebase.
+The hunk applies to main's own copy of the file without a rebase, tested against
+it rather than against the pin: both patch(1) and git apply report "succeeded at
+410 (offset 2 lines)" and exit 0. The context matches; only the line number has
+moved, so anyone comparing the hunk header's 408 against main will see the two
+lines and should not take them for a mismatch.
 
 --- a/src/freedreno/ir3/ir3_compiler_nir.c
 +++ b/src/freedreno/ir3/ir3_compiler_nir.c
