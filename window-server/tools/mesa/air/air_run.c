@@ -45,6 +45,7 @@
 #include <xf86drm.h>
 #endif
 #include "util/format/u_format.h"
+#include "util/half_float.h"
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
@@ -573,6 +574,7 @@ main(int argc, char **argv)
     */
    enum pipe_format rt_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
    bool rt_is_float = true;
+   bool rt_is_half = false;
    /* Which attachment to read back: the lowest one the shader writes, not
     * target 0. clearFragment04 writes FRAG_RESULT_DATA1 alone, and target 0
     * then holds the clear colour -- a correct result that looks exactly like
@@ -595,6 +597,33 @@ main(int argc, char **argv)
           */
          rt_format = PIPE_FORMAT_R32G32B32A32_UINT;
          rt_is_float = false;
+      } else if (base == GLSL_TYPE_FLOAT16) {
+         /* A half return needs a half target. Through a 32-bit one the half is
+          * widened the moment it is written, and NIR then folds the conversion
+          * that produced it into a 32-bit one: the generated Adreno code for
+          * air.convert.f.f16.u.i32 was four cov.u32f32 and not one cov.u32f16,
+          * so the shader computed f32(x) while the reference computed f16(x)
+          * and the comparison meant nothing. Ten declarations of the corpus
+          * return half and every one of them was being reported as agreeing on
+          * the strength of a case that was never compared (docs/air.md,
+          * section 4 item 4).
+          *
+          * The chain is still u32 -> f32 -> f16 rather than a single
+          * conversion wherever NIR widens before the store, so a value needing
+          * to round at both steps can differ from one direct conversion by
+          * double rounding. None of the pool's values does, but a future one
+          * might, and that is a property of the harness and not of the GPU.
+          */
+         /* As of now nothing reaches this branch: tools/air/intrincheck.py packs
+          * every float-ish result into a float4, so no generated shader declares
+          * a half output. It is here because the target was one of the two things
+          * missing and is the half that belongs on this side; the other half needs
+          * a half render target in the generator, whose air.arg_type_name the
+          * corpus does not attest (docs/air.md, section 4 item 4).
+          */
+         rt_format = PIPE_FORMAT_R16G16B16A16_FLOAT;
+         rt_is_float = true;
+         rt_is_half = true;
       } else {
          rt_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
          rt_is_float = true;
@@ -885,7 +914,9 @@ main(int argc, char **argv)
    printf("air_run: the pixel at (0, 0) of render target %u came back as:\n",
           read_rt);
    for (unsigned c = 0; c < 4; c++) {
-      if (rt_is_float)
+      if (rt_is_half)
+         printf("  %.9g\n", (double)_mesa_half_to_float(((uint16_t *)pix)[c]));
+      else if (rt_is_float)
          printf("  %.9g\n", (double)((float *)pix)[c]);
       else
          printf("  %u\n", ((uint32_t *)pix)[c]);

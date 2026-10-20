@@ -38,10 +38,24 @@ air.convert.f.{f32,v2f32,v3f32}.{u,s}.* disagree with C on exactly the inputs
 that need rounding -- 5 declarations, and i2f truncates just as u2f does. Two
 unrelated front ends reaching the same instruction return the same wrong number.
 
-Not verified: whether the same field is honoured for a 16-bit destination. That
-branch covers TYPE_F16 as well, but this port's harness cannot read a half back
-(air_run has no 16-bit render target), so the ten half-returning declarations of
-the corpus are set aside rather than claimed either way.
+The case for this change is the destinations where a rounding mode is REQUIRED:
+integer to float, where IEEE-754, GLSL and OpenCL all specify
+round-to-nearest-even, and which the measurements above cover. It is deliberately
+not argued from the rest of the branch.
+
+Not verified: whether the field is honoured for a 16-bit destination. The branch
+covers TYPE_F16 too, and the measurements do not reach it -- this port's harness
+packs every half result into a float4, so no shader it generates declares a half
+output, and a half render target appears in none of the 456 modules of the corpus
+it was built from.
+
+Worth a reviewer's attention rather than hidden: one F16 path through this branch
+is pack_half_2x16, and nir_lower_mediump.c says of it "pack_half rounding is
+undefined". Where nothing is required, setting ROUND_EVEN changes behaviour
+without correcting it -- permitted either way, and not part of the argument here.
+If that is unwelcome, the narrower change is to set the default only when the
+source is an integer type, which is where the requirement lives; the measurements
+above would be unaffected.
 
 The block is byte-identical in Mesa 26.2.5, the newest release at the time of
 writing, checked by extracting that one file from archive.mesa3d.org, so this is
