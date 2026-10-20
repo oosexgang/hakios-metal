@@ -1040,6 +1040,40 @@ clone_val(struct air_ctx *c, const struct air_val *v)
    return n;
 }
 
+/* What a value turned out to be, for a message that has to be read without the
+ * module in hand. A refusal that only says "not constant" sends the reader to
+ * llvm-dis to find out which of six things it was, and the three kernels that
+ * stopped on a shuffle mask cost exactly that detour.
+ */
+static const char *
+air_value_kind_name(const struct air_value *v)
+{
+   if (!v)
+      return "nothing";
+   const struct air_constant *c = air_value_as_constant(v);
+   if (!c) {
+      switch (v->kind) {
+      case AIR_VALUE_GLOBAL:      return "a global";
+      case AIR_VALUE_FUNCTION:    return "a function";
+      case AIR_VALUE_ARGUMENT:    return "a function argument";
+      case AIR_VALUE_INSTRUCTION: return "an instruction";
+      case AIR_VALUE_METADATA:    return "metadata";
+      default:                    return "a value of an unknown kind";
+      }
+   }
+   switch (c->ckind) {
+   case AIR_CONST_INT:       return "an integer";
+   case AIR_CONST_FLOAT:     return "a float";
+   case AIR_CONST_NULL:      return "zeroinitializer";
+   case AIR_CONST_UNDEF:     return "undef";
+   case AIR_CONST_POISON:    return "poison";
+   case AIR_CONST_AGGREGATE: return "an aggregate of constants";
+   case AIR_CONST_DATA:      return "a vector of plain integers";
+   case AIR_CONST_EXPR:      return "a constant expression";
+   }
+   return "a constant of an unknown kind";
+}
+
 static bool
 translate_instruction(struct air_ctx *c, const struct air_inst *in)
 {
@@ -1110,17 +1144,28 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             sel = (int32_t)mk->data[i];
          } else if (mk && mk->ckind == AIR_CONST_AGGREGATE && i < mk->num_elems) {
             const struct air_constant *e = air_value_as_constant(mk->elems[i]);
-            if (!e || (e->ckind != AIR_CONST_INT && e->ckind != AIR_CONST_UNDEF &&
+            /* The mask is an aggregate rather than plain data whenever a lane
+             * is poison, so <i32 0, i32 poison, ...> -- what a Metal
+             * half2-to-half4 widening compiles to -- mixes LLVM's two
+             * spellings of a constant integer. air_const_as_uint reads both.
+             */
+            uint64_t lane = 0;
+            bool have = e && air_const_as_uint(e, &lane);
+            if (!e || (!have && e->ckind != AIR_CONST_UNDEF &&
                        e->ckind != AIR_CONST_POISON))
-               return air_error(c, "instruction: a shuffle mask that is not constant");
-            undef = e->ckind != AIR_CONST_INT;
-            sel = undef ? 0 : (int32_t)e->u;
+               return air_error(c, "instruction: element %u of a shuffle mask is %s",
+                                i, air_value_kind_name(mk->elems[i]));
+            undef = !have;
+            sel = have ? (int32_t)lane : 0;
          } else if (mk && (mk->ckind == AIR_CONST_NULL)) {
             sel = 0;
          } else if (mk && (mk->ckind == AIR_CONST_UNDEF || mk->ckind == AIR_CONST_POISON)) {
             undef = true;
          } else {
-            return air_error(c, "instruction: a shuffle mask that is not constant");
+            return air_error(c, "instruction: a shuffle mask that is %s, with %u of the "
+                                "%u elements it needs",
+                             air_value_kind_name(in->operands[2]),
+                             mk ? mk->num_elems : 0, n);
          }
          if (undef) {
             comps[i] = nir_undef(&c->b, 1, x->bit_size);
