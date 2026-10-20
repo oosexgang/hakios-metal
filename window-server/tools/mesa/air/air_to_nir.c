@@ -1325,6 +1325,7 @@ reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *or
 }
 
 static bool translate_body(struct air_ctx *c);
+static void materialise_globals(struct air_ctx *c);
 
 /* A function of the module, translated as a nir_function so that
  * nir_inline_functions can fold it into its callers afterwards.
@@ -1343,9 +1344,33 @@ static bool translate_body(struct air_ctx *c);
  * entries in place would let a callee resolve a value it cannot see.
  */
 static nir_function *
-translate_callee(struct air_ctx *c, const struct air_function *f)
+translate_callee(struct air_ctx *c, const struct air_function *f,
+                 struct air_val **argv, bool *is_param)
 {
-   struct hash_entry *e = _mesa_hash_table_search(c->fns, f);
+   /* A texture, sampler or buffer argument is not a value in this frontend: it
+    * is resolved at translation time into a binding, and tex_handle wants an
+    * AIR_VAL_PTR rather than an SSA def. Such an argument is bound from the
+    * caller's own resolution and takes no NIR parameter, which specialises the
+    * callee to its call site -- so it is not cached. Each of the four modules
+    * that needs this has exactly one call site, counted beforehand.
+    *
+    * A pointer carrying a byte offset is refused instead: that offset is an
+    * nir_def of the CALLER's impl, and using it here would be the same
+    * cross-function def/use that the globals used to cause.
+    */
+   bool specialised = false;
+   for (unsigned i = 0; i < f->num_args; i++) {
+      bool ptr = argv && argv[i] && argv[i]->kind == AIR_VAL_PTR;
+      if (ptr && argv[i]->ptr.offset) {
+         air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
+                      "argument %u, which would use the caller's own value here", i);
+         return NULL;
+      }
+      is_param[i] = !ptr;
+      specialised |= ptr;
+   }
+
+   struct hash_entry *e = specialised ? NULL : _mesa_hash_table_search(c->fns, f);
    if (e)
       return e->data;
 
@@ -1378,16 +1403,22 @@ translate_callee(struct air_ctx *c, const struct air_function *f)
       };
    }
    for (unsigned i = 0; i < f->num_args; i++) {
+      if (!is_param[i])
+         continue;
       const struct air_type *at = f->args[i].type;
       fn->params[idx++] = (nir_parameter){
          .num_components = (uint8_t)air_nir_components(at),
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
       };
    }
+   fn->num_params = idx;   /* the pointers took no parameter */
 
    /* cached before the body is translated, so that a callee which calls itself
     * meets its own declaration rather than being translated for ever */
-   _mesa_hash_table_insert(c->fns, f, fn);
+   if (!specialised)
+      _mesa_hash_table_insert(c->fns, f, fn);
+   else
+      _mesa_hash_table_insert(c->fns, fn, fn);
 
    nir_builder saved_b = c->b;
    const struct air_function *saved_fn = c->fn;
@@ -1408,6 +1439,9 @@ translate_callee(struct air_ctx *c, const struct air_function *f)
    c->b.impl->structured = false;
    c->ret_deref = NULL;
 
+   /* this function's own globals, built in its own builder */
+   materialise_globals(c);
+
    bool ok = true;
    if (has_ret) {
       /* The caller passes the deref's own def and the callee casts it back,
@@ -1418,9 +1452,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f)
       c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
                                           nir_var_function_temp, ret_glsl, 0);
    }
+   unsigned pidx = has_ret ? 1 : 0;
    for (unsigned i = 0; i < f->num_args && ok; i++) {
-      nir_def *p = nir_load_param(&c->b, i + (has_ret ? 1 : 0));
-      air_set(c, &f->args[i], air_val_ssa(c, p));
+      if (!is_param[i]) {
+         air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
+         continue;
+      }
+      air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
    }
    if (ok)
       ok = translate_body(c);
@@ -1460,15 +1498,26 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
       return air_error(c, "intrinsic: a call of %s, which is not a function of this "
                           "module", name);
 
-   nir_function *fn = translate_callee(c, f);
+   if (in->num_operands - 1 != f->num_args)
+      return air_error(c, "intrinsic: a call of %s with %u arguments, wanting %u", name,
+                       in->num_operands - 1, f->num_args);
+
+   /* resolved in the CALLER's value map, which is the live one here */
+   struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *,
+                                         MAX2(f->num_args, 1));
+   bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
+   for (unsigned i = 0; i < f->num_args; i++) {
+      argv[i] = air_get(c, in->operands[i + 1]);
+      if (!argv[i])
+         return false;
+   }
+
+   nir_function *fn = translate_callee(c, f, argv, is_param);
    if (!fn)
       return false;   /* translate_callee has said why */
 
    const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
    bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
-   if (in->num_operands - 1 != f->num_args)
-      return air_error(c, "intrinsic: a call of %s with %u arguments, wanting %u", name,
-                       in->num_operands - 1, f->num_args);
 
    nir_variable *tmp = NULL;
    nir_call_instr *call = nir_call_instr_create(c->nir, fn);
@@ -1484,6 +1533,8 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    }
    /* operand 0 is the callee; the arguments follow it */
    for (unsigned i = 0; i < f->num_args; i++) {
+      if (!is_param[i])
+         continue;
       nir_def *a = air_get_ssa(c, in->operands[i + 1]);
       if (!a)
          return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
@@ -1650,20 +1701,28 @@ function_constant_index(struct air_ctx *c, const struct air_global *g)
    return -1;
 }
 
+/* Decide what every global is: once per shader, because this appends inline
+ * samplers to info->resources and lays out the shared and scratch memory. It
+ * records rather than builds -- making the value needs a builder, and which
+ * function's builder matters (see materialise_globals).
+ */
 static void
-translate_globals(struct air_ctx *c)
+plan_globals(struct air_ctx *c)
 {
+   c->global_plan = rzalloc_array(c->mem_ctx, struct air_global_plan,
+                                  MAX2(c->m->num_globals, 1));
    for (unsigned i = 0; i < c->m->num_globals; i++) {
+      struct air_global_plan *pl = &c->global_plan[i];
       const struct air_global *g = c->m->globals[i];
       const char *name = g->base.name ? g->base.name : "";
 
       /* llvm.compiler.used and llvm.global_ctors are lists for the linker,
        * not memory the shader reads
        */
-      if (!strncmp(name, "llvm.", 5))
+      if (!strncmp(name, "llvm.", 5)) {
+         pl->skip = true;
          continue;
-
-      struct air_ptr p = { .pointee = g->value_type };
+      }
 
       if (g->externally_initialized) {
          int idx = function_constant_index(c, g);
@@ -1672,8 +1731,8 @@ translate_globals(struct air_ctx *c)
                          "function constant");
             return;
          }
-         p.class = AIR_PTR_FUNCTION_CONSTANT;
-         p.binding = idx;
+         pl->class = AIR_PTR_FUNCTION_CONSTANT;
+         pl->binding = idx;
       } else if (!strncmp(name, "__air_sampler_state", 19)) {
          /* A sampler the shader declares itself. It needs a real index, not a
           * sentinel: the Adreno's texture instruction holds the sampler in a
@@ -1685,8 +1744,8 @@ translate_globals(struct air_ctx *c)
          for (unsigned k = 0; k < c->info->num_resources; k++)
             if (c->info->resources[k].kind == AIR_RESOURCE_SAMPLER)
                next = MAX2(next, c->info->resources[k].index + 1);
-         p.class = AIR_PTR_SAMPLER;
-         p.binding = next;
+         pl->class = AIR_PTR_SAMPLER;
+         pl->binding = next;
 
          uint64_t word = 0;
          if (g->init && !air_const_uint(g->init, &word)) {
@@ -1705,8 +1764,9 @@ translate_globals(struct air_ctx *c)
          /* a static threadgroup array */
          unsigned align = MAX2(g->align, air_type_abi_align(c->m, g->value_type));
          c->shared_size = ALIGN_POT(c->shared_size, MAX2(align, 1));
-         p.class = AIR_PTR_SHARED;
-         p.offset = nir_imm_int(&c->b, c->shared_size);
+         pl->class = AIR_PTR_SHARED;
+         pl->offset = c->shared_size;
+         pl->has_offset = true;
          c->shared_size += air_type_alloc_size(c->m, g->value_type);
       } else {
          /* a program-scope variable: private to the invocation, written by
@@ -1714,10 +1774,34 @@ translate_globals(struct air_ctx *c)
           */
          unsigned align = MAX2(g->align, air_type_abi_align(c->m, g->value_type));
          c->scratch_size = ALIGN_POT(c->scratch_size, MAX2(align, 1));
-         p.class = AIR_PTR_SCRATCH;
-         p.offset = nir_imm_int(&c->b, c->scratch_size);
+         pl->class = AIR_PTR_SCRATCH;
+         pl->offset = c->scratch_size;
+         pl->has_offset = true;
          c->scratch_size += air_type_alloc_size(c->m, g->value_type);
       }
+   }
+}
+
+/* Build the globals as values of the function being translated now. Called for
+ * the entry point and again for every callee, because the byte offset is an
+ * nir_def and a def belongs to one impl: handing a callee the entry point's
+ * defs is what crashed nir_repair_ssa. Module-level constants need no such
+ * care -- air_get materialises one on demand in whatever builder asks.
+ */
+static void
+materialise_globals(struct air_ctx *c)
+{
+   for (unsigned i = 0; i < c->m->num_globals; i++) {
+      const struct air_global_plan *pl = &c->global_plan[i];
+      if (pl->skip)
+         continue;
+      const struct air_global *g = c->m->globals[i];
+      struct air_ptr p = {
+         .pointee = g->value_type,
+         .class = pl->class,
+         .binding = pl->binding,
+         .offset = pl->has_offset ? nir_imm_int(&c->b, pl->offset) : NULL,
+      };
       air_set(c, &g->base, air_val_ptr(c, p));
    }
 }
@@ -1873,7 +1957,9 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    }
 
    if (!c.error[0])
-      translate_globals(&c);
+      plan_globals(&c);
+   if (!c.error[0])
+      materialise_globals(&c);
    if (!c.error[0])
       run_static_initializers(&c);
 
