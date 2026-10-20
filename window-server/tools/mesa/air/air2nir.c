@@ -34,6 +34,12 @@
 #include "air_module.h"
 #include "util/ralloc.h"
 
+/* --library: translate an air.visible library function inside a generated
+ * entry point (nir_air.h). Off by default, because a wrapped function is not
+ * an entry point of the corpus and must not be counted as one.
+ */
+static bool library_wrapper = false;
+
 static const nir_shader_compiler_options default_options = {
    .lower_fdiv = false,
 };
@@ -116,11 +122,36 @@ stage_name(int stage)
  * strongest one, and it needs no GPU.
  */
 
+/* The argument buffer of a wrapped library function holds floats, not the byte
+ * pattern.
+ *
+ * Every one of these functions is compiled with no-nans-fp-math and
+ * no-infs-fp-math: the module promises its inputs are finite. Arbitrary bytes
+ * are mostly not -- they are infinities, NaNs and denormals -- so the inputs
+ * would land outside the contract the shader was compiled under, where
+ * 0 * inf may legally be either NaN or inf and a disagreement means nothing.
+ * One case did disagree exactly there (folded NaN, softpipe +inf) and said
+ * nothing about either side.
+ *
+ * Word w is ((w * 13) % 29 - 14) / 4: finite, exactly representable in
+ * binary32, and different for 29 words running -- so a harness that mixed up
+ * two slots, or two lanes of one slot, would get a different answer. cpuref.py
+ * fills the same words.
+ */
+static uint8_t
+library_byte(unsigned i)
+{
+   float f = (float)((int)((i / 4 * 13) % 29) - 14) / 4.0f;
+   uint32_t u;
+   memcpy(&u, &f, sizeof(u));
+   return (u >> (8 * (i % 4))) & 0xff;
+}
+
 /* the same pattern cpuref.py fills its buffers with */
 static uint8_t
 pattern_byte(unsigned i)
 {
-   return (i * 7 + 13) & 0xff;
+   return library_wrapper ? library_byte(i) : (i * 7 + 13) & 0xff;
 }
 
 struct eval_state {
@@ -206,6 +237,62 @@ print_output(nir_variable *var, nir_def *value)
    printf("\n");
 }
 
+/* A wrapped library function returns its value by storing it to a buffer, not
+ * to a shader output, so --eval has to read it from there. The type name comes
+ * from Apple's own air.visible_output metadata, carried on the resource: how
+ * to print the bytes is not something this can infer from a store.
+ */
+static unsigned
+print_buffer_stores(nir_shader *nir, const struct air_shader_info *info)
+{
+   unsigned printed = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_ssbo)
+               continue;
+            if (!nir_src_is_const(intr->src[1]))
+               continue;
+            unsigned index = nir_src_as_uint(intr->src[1]);
+            const char *type_name = NULL;
+            for (unsigned i = 0; i < info->num_resources; i++) {
+               const struct air_resource *r = &info->resources[i];
+               if (r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->index == index && r->write)
+                  type_name = r->type_name;
+            }
+            nir_def *value = intr->src[0].ssa;
+            printf("  buffer%u%*s", index, 18, "");
+            if (!nir_src_is_const(nir_src_for_ssa(value))) {
+               printf("did not fold to a constant\n");
+               printed++;
+               continue;
+            }
+            bool is_float = !type_name || strstr(type_name, "float") ||
+                            strstr(type_name, "half");
+            for (unsigned c = 0; c < value->num_components; c++) {
+               uint64_t bits = nir_src_comp_as_uint(nir_src_for_ssa(value), c);
+               if (is_float && value->bit_size == 32) {
+                  float f;
+                  uint32_t u = bits;
+                  memcpy(&f, &u, 4);
+                  printf("%s%.9g", c ? " " : "", (double)f);
+               } else if (is_float && value->bit_size == 16) {
+                  printf("%s0x%04" PRIx64, c ? " " : "", bits);
+               } else {
+                  printf("%s%" PRIu64, c ? " " : "", bits);
+               }
+            }
+            printf("\n");
+            printed++;
+         }
+      }
+   }
+   return printed;
+}
+
 static int
 eval_module(const struct module_ref *mod)
 {
@@ -213,7 +300,8 @@ eval_module(const struct module_ref *mod)
    const char *err = NULL;
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
-   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc };
+   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                        .library_wrapper = library_wrapper };
    struct air_shader_info info;
    nir_shader *nir = air_to_nir(ctx, mod->bitcode, mod->size, NULL, &options,
                                 &default_options, &info, &err);
@@ -251,6 +339,7 @@ eval_module(const struct module_ref *mod)
 
    printf("eval: the outputs this shader stores:\n");
    unsigned printed = 0;
+   printed += print_buffer_stores(nir, &info);
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -311,7 +400,8 @@ report_one(const struct module_ref *mod)
     */
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
-   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc };
+   struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                        .library_wrapper = library_wrapper };
    if (num_fc)
       printf("\tfc=%u", num_fc);
 
@@ -343,6 +433,8 @@ main(int argc, char **argv)
 {
    enum { TRANSLATE, LL, LIST, REPORT, EVAL } mode = TRANSLATE;
    int i = 1;
+   while (i < argc && !strcmp(argv[i], "--library"))
+      library_wrapper = true, i++;
    if (i < argc && !strcmp(argv[i], "--ll"))
       mode = LL, i++;
    else if (i < argc && !strcmp(argv[i], "--list"))
@@ -353,7 +445,8 @@ main(int argc, char **argv)
       mode = EVAL, i++;
    if (i >= argc) {
       fprintf(stderr,
-              "usage: air2nir [--ll | --list | --report | --eval] FILE [FUNCTION]\n");
+              "usage: air2nir [--library] [--ll | --list | --report | --eval] "
+              "FILE [FUNCTION]\n");
       return 2;
    }
 
@@ -416,7 +509,8 @@ main(int argc, char **argv)
       }
       struct air_constant_value *fc;
       unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
-      struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc };
+      struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
+                                        .library_wrapper = library_wrapper };
       struct air_shader_info info;
       nir_shader *nir = air_to_nir(ctx, mods[k].bitcode, mods[k].size, NULL, &options,
                                    &default_options, &info, &err);
