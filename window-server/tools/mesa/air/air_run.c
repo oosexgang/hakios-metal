@@ -623,7 +623,18 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
          .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
          .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
          .unnormalized_coords = 1 });
-      pipe->bind_sampler_states(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, &csampler);
+      /* one entry per texture, not the address of one pointer. bind_sampler_states
+       * reads num_tex pointers from what it is given, so passing &csampler made
+       * the driver take whatever followed that single variable on the stack and
+       * store it as samplers[1..]; fd6_texture_state then dereferenced those for
+       * ->seqno and died at a wild address. It only showed with two or more
+       * textures, which is why 22 kernels bound images here without trouble and
+       * four did not. The draw path below always did this correctly.
+       */
+      void *csamplers[MAX_IMG] = { 0 };
+      for (unsigned i = 0; i < num_tex && i < MAX_IMG; i++)
+         csamplers[i] = csampler;
+      pipe->bind_sampler_states(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, csamplers);
       pipe->set_sampler_views(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, 0, false, views);
    }
 
@@ -645,10 +656,11 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
    printf("air_run: dispatching %ux%ux1 threads in one workgroup; %u device buffer%s bound, "
           "%u of them written, filled with (i * 7 + 13) & 0xff\n",
           GRID, GRID, num_ssbo, num_ssbo == 1 ? "" : "s", num_written);
-   if (num_img)
-      printf("air_run: %u image%s bound (%u written), %ux%u, texel (x,y,z) of slot n = "
-             "(100+x+1000n, 200+y, 300+x+y+z, 400)\n", num_img, num_img == 1 ? "" : "s",
-             num_img_written, TEX_SIZE, TEX_SIZE);
+   if (num_img || num_tex)
+      printf("air_run: %u image%s bound (%u written) and %u texture%s, %ux%u, texel (x,y,z) of "
+             "slot n = (100+x+1000n, 200+y, 300+x+y+z, 400)\n", num_img,
+             num_img == 1 ? "" : "s", num_img_written, num_tex, num_tex == 1 ? "" : "s",
+             TEX_SIZE, TEX_SIZE);
    pipe->launch_grid(pipe, &grid);
    pipe->flush(pipe, NULL, 0);
 
