@@ -73,6 +73,18 @@ struct air_ctx {
    /* phi -> nir register decl */
    struct hash_table *phi_regs;
 
+   /* A call of another function in the module becomes a nir_call, and
+    * nir_inline_functions folds it in afterwards. These two carry the state
+    * that needs: the functions already translated, so a callee shared by two
+    * call sites is translated once, and -- while a callee is being
+    * translated -- the deref its `ret` has to store through, since a NIR call
+    * returns nothing and the convention is an out-parameter at index 0.
+    * ret_deref is NULL while the entry point is being translated, which is how
+    * emit_return tells the two apart.
+    */
+   struct hash_table *fns;
+   nir_deref_instr *ret_deref;
+
    /* what the entry point's parameters are */
    unsigned num_params;
    struct air_val **params;
@@ -117,5 +129,7 @@ struct air_ptr air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes
 
 /* air.* and llvm.* calls; the result is set on the instruction by the callee */
 bool air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *name);
+/* a call of a function defined in this module, folded in by nir_inline_functions */
+bool air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name);
 
 #endif /* AIR_PRIVATE_H */

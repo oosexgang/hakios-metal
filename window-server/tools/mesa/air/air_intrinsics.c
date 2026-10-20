@@ -1000,13 +1000,8 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (!strncmp(name, "llvm.", 5))
       return llvm_op(c, in, name);
 
-   if (strncmp(name, "air.", 4)) {
-      /* a call of another function in the module: inlining them is the
-       * translator's job and is not done yet (no system shader needs it:
-       * every one is a single function after Apple's own inliner)
-       */
-      return air_error(c, "intrinsic: a call of %s, a function in the module", name);
-   }
+   if (strncmp(name, "air.", 4))
+      return air_call_in_module(c, in, name);
 
    struct air_name n;
    if (!split_name(name, &n))

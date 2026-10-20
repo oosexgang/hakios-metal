@@ -1245,6 +1245,19 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
    if (!v)
       return false;
 
+   /* Inside a callee the return value goes through the out-parameter the
+    * caller passed, because a NIR call has no destination. The entry point
+    * has no such parameter and its return is its render targets, below.
+    */
+   if (c->ret_deref) {
+      nir_def *d = air_get_ssa(c, in->operands[0]);
+      if (!d)
+         return air_error(c, "instruction: a return of a value this cannot put in a "
+                             "register, from a function called in the module");
+      nir_store_deref(&c->b, c->ret_deref, d, nir_component_mask(d->num_components));
+      return true;
+   }
+
    const struct air_type *rt = in->operands[0]->type;
    if (rt->kind == AIR_TYPE_STRUCT) {
       if (v->kind != AIR_VAL_AGG || v->num_elems != rt->num_members)
@@ -1309,6 +1322,179 @@ reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *or
       order[num_post - 1 - i] = t;
    }
    return num_post;
+}
+
+static bool translate_body(struct air_ctx *c);
+
+/* A function of the module, translated as a nir_function so that
+ * nir_inline_functions can fold it into its callers afterwards.
+ *
+ * Translating it in place at the call site was the other option and is worse:
+ * the callees here are not straight-line code -- FilmGrainLuma has 17 blocks
+ * and 24 branches -- so inlining by hand would mean reproducing a CFG inside
+ * another one, with its own block map and phis. NIR already has that pass.
+ *
+ * The return goes through an out-parameter at index 0, with is_return set,
+ * because a NIR call has no destination; this is the convention spirv_to_nir
+ * uses (vtn_cfg.c) and the one nir_inline_functions expects.
+ *
+ * The per-function tables are swapped rather than shared: values, blocks and
+ * phis are all keyed on this function's own objects, and leaving the caller's
+ * entries in place would let a callee resolve a value it cannot see.
+ */
+static nir_function *
+translate_callee(struct air_ctx *c, const struct air_function *f)
+{
+   struct hash_entry *e = _mesa_hash_table_search(c->fns, f);
+   if (e)
+      return e->data;
+
+   if (f->is_declaration || !f->num_blocks) {
+      air_error(c, "intrinsic: a call of %s, which the module only declares",
+                f->base.name ? f->base.name : "a function");
+      return NULL;
+   }
+
+   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
+   bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
+   unsigned nparams = f->num_args + (has_ret ? 1 : 0);
+   nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
+   fn->num_params = nparams;
+   fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
+   fn->should_inline = true;
+
+   unsigned idx = 0;
+   const struct glsl_type *ret_glsl = NULL;
+   if (has_ret) {
+      unsigned bits = air_nir_bit_size(c, rt);
+      unsigned comps = air_nir_components(rt);
+      ret_glsl = glsl_vector_type(bits == 16 ? GLSL_TYPE_FLOAT16 :
+                                  bits == 64 ? GLSL_TYPE_UINT64 : GLSL_TYPE_UINT, comps);
+      fn->params[idx++] = (nir_parameter){
+         .num_components = 1, .bit_size = 32,
+         .is_return = true,
+         .mode = nir_var_function_temp,
+         .type = ret_glsl,
+      };
+   }
+   for (unsigned i = 0; i < f->num_args; i++) {
+      const struct air_type *at = f->args[i].type;
+      fn->params[idx++] = (nir_parameter){
+         .num_components = (uint8_t)air_nir_components(at),
+         .bit_size = (uint8_t)air_nir_bit_size(c, at),
+      };
+   }
+
+   /* cached before the body is translated, so that a callee which calls itself
+    * meets its own declaration rather than being translated for ever */
+   _mesa_hash_table_insert(c->fns, f, fn);
+
+   nir_builder saved_b = c->b;
+   const struct air_function *saved_fn = c->fn;
+   struct hash_table *sv = c->values, *sb = c->blocks,
+                     *sp = c->phi_cursors, *sr = c->phi_regs;
+   nir_deref_instr *saved_ret = c->ret_deref;
+
+   c->fn = f;
+   c->values = _mesa_pointer_hash_table_create(c->mem_ctx);
+   c->blocks = _mesa_pointer_hash_table_create(c->mem_ctx);
+   c->phi_cursors = _mesa_pointer_hash_table_create(c->mem_ctx);
+   c->phi_regs = _mesa_pointer_hash_table_create(c->mem_ctx);
+   c->b = nir_builder_at(nir_before_impl(nir_function_impl_create(fn)));
+   /* as for the entry point: this translator emits an unstructured CFG with
+    * nir_goto, and nir_goto_if asserts on a structured impl. A new impl is
+    * structured by default, so a callee crashed on its first branch -- which
+    * is what the corpus's reader count caught, 456 falling to 454. */
+   c->b.impl->structured = false;
+   c->ret_deref = NULL;
+
+   bool ok = true;
+   if (has_ret) {
+      /* The caller passes the deref's own def and the callee casts it back,
+       * which is the convention nir_functions.c documents: load_param is
+       * replaced by the call's source at inline time and nir_opt_deref removes
+       * the cast afterwards.
+       */
+      c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
+                                          nir_var_function_temp, ret_glsl, 0);
+   }
+   for (unsigned i = 0; i < f->num_args && ok; i++) {
+      nir_def *p = nir_load_param(&c->b, i + (has_ret ? 1 : 0));
+      air_set(c, &f->args[i], air_val_ssa(c, p));
+   }
+   if (ok)
+      ok = translate_body(c);
+
+   c->b = saved_b;
+   c->fn = saved_fn;
+   c->values = sv;
+   c->blocks = sb;
+   c->phi_cursors = sp;
+   c->phi_regs = sr;
+   c->ret_deref = saved_ret;
+   return ok ? fn : NULL;
+}
+
+/* A call of a function this module defines. The callee is translated as a
+ * nir_function (above) and the call becomes a nir_call, which
+ * nir_inline_functions folds in after the whole shader is translated.
+ *
+ * This used to be refused outright, with a comment saying no system shader
+ * needed it because Apple's own inliner had already flattened every one. That
+ * was not true: six entry points of the corpus call a function in their module
+ * and five of them are compute kernels, which is how the claim went unnoticed
+ * -- nothing dispatched a kernel until there was something to dispatch it with.
+ */
+bool
+air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name)
+{
+   const struct air_function *f = NULL;
+   for (unsigned i = 0; i < c->m->num_functions; i++) {
+      const char *fname = c->m->functions[i]->base.name;
+      if (fname && !strcmp(fname, name)) {
+         f = c->m->functions[i];
+         break;
+      }
+   }
+   if (!f)
+      return air_error(c, "intrinsic: a call of %s, which is not a function of this "
+                          "module", name);
+
+   nir_function *fn = translate_callee(c, f);
+   if (!fn)
+      return false;   /* translate_callee has said why */
+
+   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
+   bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
+   if (in->num_operands - 1 != f->num_args)
+      return air_error(c, "intrinsic: a call of %s with %u arguments, wanting %u", name,
+                       in->num_operands - 1, f->num_args);
+
+   nir_variable *tmp = NULL;
+   nir_call_instr *call = nir_call_instr_create(c->nir, fn);
+   unsigned idx = 0;
+   if (has_ret) {
+      unsigned bits = air_nir_bit_size(c, rt);
+      unsigned comps = air_nir_components(rt);
+      const struct glsl_type *t =
+         glsl_vector_type(bits == 16 ? GLSL_TYPE_FLOAT16 :
+                          bits == 64 ? GLSL_TYPE_UINT64 : GLSL_TYPE_UINT, comps);
+      tmp = nir_local_variable_create(c->b.impl, t, "callret");
+      call->params[idx++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, tmp)->def);
+   }
+   /* operand 0 is the callee; the arguments follow it */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      nir_def *a = air_get_ssa(c, in->operands[i + 1]);
+      if (!a)
+         return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
+                          i, name);
+      call->params[idx++] = nir_src_for_ssa(a);
+   }
+   nir_builder_instr_insert(&c->b, &call->instr);
+
+   if (has_ret)
+      air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
+   return true;
 }
 
 static bool
@@ -1633,6 +1819,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    c.nir = nir_shader_create(mem_ctx, stage, nir_options, NULL);
    c.nir->info.name = ralloc_strdup(c.nir, fn->base.name ? fn->base.name : "air");
    c.nir->info.internal = false;
+   c.fns = _mesa_pointer_hash_table_create(ctx);
    nir_function *main = nir_function_create(c.nir, "main");
    main->is_entrypoint = true;
    c.b = nir_builder_at(nir_before_impl(nir_function_impl_create(main)));
@@ -1737,6 +1924,26 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    }
 
    nir_lower_goto_ifs(c.nir);
+
+   /* Fold in any function of the module the shader called, and then drop the
+    * callees. This has to come after nir_lower_goto_ifs and not before: this
+    * translator emits an unstructured CFG, and nir_inline_functions walks the
+    * control-flow tree, which asserts on one. The pass order inside is the one
+    * nir_functions.c prescribes -- inline, then nir_opt_deref to undo the cast
+    * a pointer parameter leaves behind, then delete everything but the entry
+    * point, which every consumer of this NIR assumes.
+    */
+   if (_mesa_hash_table_num_entries(c.fns)) {
+      NIR_PASS(_, c.nir, nir_inline_functions);
+      NIR_PASS(_, c.nir, nir_opt_deref);
+      nir_remove_non_entrypoints(c.nir);
+      NIR_PASS(_, c.nir, nir_lower_variable_initializers, nir_var_function_temp);
+      NIR_PASS(_, c.nir, nir_split_var_copies);
+      NIR_PASS(_, c.nir, nir_lower_var_copies);
+      NIR_PASS(_, c.nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, c.nir, nir_opt_dce);
+   }
+
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
 
    if (info) {
