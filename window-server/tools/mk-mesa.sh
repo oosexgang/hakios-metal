@@ -20,6 +20,19 @@
 #   gl.xml               their prototypes (the Khronos registry as Mesa has it): for userland/mkeagl.py
 # Needs on this machine: meson, ninja, bison, flex, python3 with venv (Mako is installed into a
 # private environment), llvm-ar.
+#
+# This build is NOT reproducible byte for byte, so do not compare one of its outputs with another
+# by hash. Measured on 20 October: two builds from the same source tree, the second with
+# build-softpipe-freedreno deleted first, gave different libOSMesa.8.dylib and air_run -- same size
+# to the byte, 9 132 774 of 14 855 048 bytes different in the library and 4 171 752 of 9 789 824 in
+# air_run, with 5 of the 6 named text symbols at new addresses. So the layout moves between builds.
+# What moves it was not established; it is not source filenames, which -Db_ndebug=true compiles out.
+#
+# The practical consequence: a hash answers whether this is the same FILE, never whether it holds
+# the same CODE, and the size answers neither -- the one-line ir3 rounding patch
+# (tools/mesa/ir3-round-default.patch) produced a library of exactly the same 14 855 048 bytes as
+# the build without it. To tell whether a patch is in a build, read the source in
+# xnu-deps/build/mesa/mesa-$VERSION, which is where this script unpacks and patches it.
 set -e
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
