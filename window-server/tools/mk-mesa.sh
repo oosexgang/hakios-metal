@@ -28,6 +28,11 @@
 # air_run, with 5 of the 6 named text symbols at new addresses. So the layout moves between builds.
 # What moves it was not established; it is not source filenames, which -Db_ndebug=true compiles out.
 #
+# This is Mesa's property and not the build system's, which is worth knowing before anyone
+# distrusts every hash here: the userland programs reproduce exactly. prebuilt/userland/init built
+# in one working copy came out byte for byte identical to the same source built in another, at a
+# different time -- so there a hash does compare builds, and only for Mesa it does not.
+#
 # The practical consequence: a hash answers whether this is the same FILE, never whether it holds
 # the same CODE, and the size answers neither -- the one-line ir3 rounding patch
 # (tools/mesa/ir3-round-default.patch) produced a library of exactly the same 14 855 048 bytes as
