@@ -316,6 +316,32 @@ air_value_as_constant(const struct air_value *v)
    return v && v->kind == AIR_VALUE_CONSTANT ? (const struct air_constant *)v : NULL;
 }
 
+/* An integer constant's value, whichever way the writer spelled it.
+ *
+ * LLVM has two encodings for a zero of a scalar type: CST_CODE_INTEGER with a
+ * value of 0, and CST_CODE_NULL. Which one a module uses is not free -- a zero
+ * that appears inside an aggregate constant is always NULL -- so anything that
+ * reads an integer constant has to accept both. Taking only INTEGER is why
+ * three of Apple's kernels stopped on a shuffle mask whose first lane was 0,
+ * and the same trap sits under every other reader of a constant integer.
+ */
+static inline bool
+air_const_as_uint(const struct air_constant *c, uint64_t *out)
+{
+   if (!c)
+      return false;
+   if (c->ckind == AIR_CONST_INT) {
+      *out = c->u;
+      return true;
+   }
+   if (c->ckind == AIR_CONST_NULL && c->base.type &&
+       c->base.type->kind == AIR_TYPE_INT) {
+      *out = 0;
+      return true;
+   }
+   return false;
+}
+
 static inline const struct air_inst *
 air_value_as_inst(const struct air_value *v)
 {

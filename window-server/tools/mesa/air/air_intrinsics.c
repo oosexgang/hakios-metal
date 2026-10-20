@@ -412,8 +412,7 @@ barrier_op(struct air_ctx *c, const struct air_inst *in)
    uint64_t flags = 2;
    const struct air_constant *k =
       in->num_operands > 1 ? air_value_as_constant(in->operands[1]) : NULL;
-   if (k && k->ckind == AIR_CONST_INT)
-      flags = k->u;
+   air_const_as_uint(k, &flags); /* leaves flags alone when it is not readable */
 
    nir_variable_mode modes = 0;
    if (flags & 1)
@@ -447,14 +446,15 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
          return false;
       if (dst->kind != AIR_VAL_PTR || src->kind != AIR_VAL_PTR)
          return air_error(c, "intrinsic: memcpy that is not between pointers");
-      if (!len || len->ckind != AIR_CONST_INT)
+      uint64_t bytes;
+      if (!air_const_as_uint(len, &bytes))
          return air_error(c, "intrinsic: memcpy of a run-time length");
       /* in 4-byte pieces, which is what every memcpy in the corpus is a
        * multiple of (they copy float vectors out of constant buffers)
        */
-      if (len->u % 4)
-         return air_error(c, "intrinsic: memcpy of %u bytes", (unsigned)len->u);
-      for (uint64_t off = 0; off < len->u; off += 4) {
+      if (bytes % 4)
+         return air_error(c, "intrinsic: memcpy of %u bytes", (unsigned)bytes);
+      for (uint64_t off = 0; off < bytes; off += 4) {
          struct air_ptr s = air_ptr_add(c, src->ptr, nir_imm_int(&c->b, off));
          struct air_ptr d = air_ptr_add(c, dst->ptr, nir_imm_int(&c->b, off));
          static const struct air_type u32 = { .kind = AIR_TYPE_INT, .bits = 32 };
@@ -472,13 +472,14 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
          return false;
       if (dst->kind != AIR_VAL_PTR)
          return air_error(c, "intrinsic: memset of something that is not a pointer");
-      if (!len || len->ckind != AIR_CONST_INT || len->u % 4)
+      uint64_t bytes;
+      if (!air_const_as_uint(len, &bytes) || bytes % 4)
          return air_error(c, "intrinsic: memset of a length that is not a multiple of 4");
       if (!nir_src_is_const(nir_src_for_ssa(byte)))
          return air_error(c, "intrinsic: memset of a run-time byte");
       uint32_t b = nir_src_as_uint(nir_src_for_ssa(byte)) & 0xff;
       uint32_t word = b | b << 8 | b << 16 | b << 24;
-      for (uint64_t off = 0; off < len->u; off += 4) {
+      for (uint64_t off = 0; off < bytes; off += 4) {
          struct air_ptr d = air_ptr_add(c, dst->ptr, nir_imm_int(&c->b, off));
          if (!air_store_ptr(c, d, nir_imm_int(&c->b, word), 4))
             return false;
