@@ -1,0 +1,65 @@
+ir3: round integer-to-float conversions to nearest when nothing says otherwise.
+
+The a6xx `cov` instruction has a rounding-mode field, and create_cov() sets it
+only from float_controls_execution_mode, which is a SPIR-V declaration. When
+nothing is declared, nir_get_rounding_mode_from_float_controls returns
+nir_rounding_mode_undef, neither branch fires, and the field keeps the zero it
+was built with -- ROUND_ZERO in instr-a3xx.h, which is truncation toward zero.
+
+So every shader that does not come from SPIR-V with an explicit rounding mode
+gets truncation where IEEE-754, GLSL and OpenCL all require round-to-nearest-even.
+On this port that is every shader: the port's OpenGL ES declares nothing, and so
+does the AIR frontend. The hardware is not at fault -- it can round, and setting
+the field makes it.
+
+Measured on the phone's Adreno 7c+ Gen 3, uint -> float, GLSL ES 3.0 through
+OSMesa with the value in a uniform so nothing could be folded on the host
+(userland/src/u2f_test.c, RC=rc.u2f), expectations from C on the host:
+
+      input         before        after      C
+  0xFFFFFFFF    4294967040   4294967296   4294967296
+  0xFFFFFF80    4294967040   4294967296   4294967296
+  0x01000001      16777216     16777216     16777216
+  0x01000003      16777218     16777220     16777220
+  0x7FFFFFFF    2147483520   2147483648   2147483648
+  0x00FFFFFF      16777215     16777215     16777215
+
+0x01000003 is the value that identifies the rule rather than merely showing a
+disagreement: it is 2^24+3, half way between the representable 2^24+2 and
+2^24+4, and both round-half-to-even and round-half-away-from-zero give 2^24+4.
+The hardware gave 2^24+2, which is neither -- it is the low bits dropped. The
+two inputs that agree before the change are exactly the two where truncation and
+rounding coincide, so agreement there is the absence of a question.
+
+Reproduced independently down a second path with no GLSL in it at all: the AIR
+frontend's own test suite (tools/air/intrincheck.py, docs/air.md section 4)
+compiles one Metal operation per module and executes it on the same GPU, and
+air.convert.f.{f32,v2f32,v3f32}.{u,s}.* disagree with C on exactly the inputs
+that need rounding -- 5 declarations, and i2f truncates just as u2f does. Two
+unrelated front ends reaching the same instruction return the same wrong number.
+
+Not verified: whether the same field is honoured for a 16-bit destination. That
+branch covers TYPE_F16 as well, but this port's harness cannot read a half back
+(air_run has no 16-bit render target), so the ten half-returning declarations of
+the corpus are set aside rather than claimed either way.
+
+The block is byte-identical in Mesa 26.2.5, the newest release at the time of
+writing, checked by extracting that one file from archive.mesa3d.org, so this is
+not an artefact of the 25.0.7 this port pins. Worth sending upstream.
+
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -408,6 +408,13 @@
+          set_cat1_round(cov.rpts, nrpt, ROUND_EVEN);
+       else if (rounding_mode == nir_rounding_mode_rtz)
+          set_cat1_round(cov.rpts, nrpt, ROUND_ZERO);
++      else
++         /* Nothing declared a mode, and the field defaults to ROUND_ZERO,
++          * which is truncation. IEEE-754, GLSL and OpenCL all require
++          * round-to-nearest-even here, so ask for it rather than letting the
++          * hardware's own default stand.
++          */
++         set_cat1_round(cov.rpts, nrpt, ROUND_EVEN);
+    }
+ 
+    return cov;
