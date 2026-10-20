@@ -22,6 +22,7 @@
  */
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -160,6 +161,40 @@ pattern_byte(unsigned i)
    return (i * 7 + 13) & 0xff;
 }
 
+/* Fill a buffer the shader is about to read.
+ *
+ * AIR_RUN_BUFFER=FILE puts that file's bytes there instead of the pattern,
+ * which is what lets a test choose the arguments an operation is called on.
+ * The reason it has to be a buffer and not a constant in the shader: ir3
+ * folds, so a shader that computes air.fast_round(0.5) from an immediate is
+ * answered by the compiler and the Adreno never runs the instruction -- the
+ * test would pass without the hardware having been asked. A value loaded from
+ * a buffer cannot be folded, and the harness knows what it put there.
+ *
+ * Returns how many bytes came from the file, so the caller can say so rather
+ * than claim a fill it did not do. A file shorter than the buffer leaves the
+ * rest as the pattern.
+ */
+static unsigned
+fill_buffer(uint8_t *bits, unsigned bytes)
+{
+   for (unsigned k = 0; k < bytes; k++)
+      bits[k] = pattern_byte(k);
+
+   const char *path = getenv("AIR_RUN_BUFFER");
+   if (!path || !*path)
+      return 0;
+
+   FILE *f = fopen(path, "rb");
+   if (!f) {
+      fprintf(stderr, "air_run: AIR_RUN_BUFFER=%s: %s\n", path, strerror(errno));
+      return 0;
+   }
+   size_t got = fread(bits, 1, bytes, f);
+   fclose(f);
+   return got;
+}
+
 /* A vertex shader for the quad: it takes the position as attribute 0 and
  * passes it through. Written here rather than translated, because what is
  * under test is the fragment shader; when the .metallib has a vertex shader of
@@ -234,14 +269,15 @@ finalize_for_gallium(nir_shader *nir)
  *     pattern), so a thread reading the wrong offset produces a wrong value
  *     and not a plausible one.
  *
- * What this does NOT yet do is give atomics a test that can fail. Seventeen of
- * the forty kernels that translate use a global atomic, and a sum written by
+ * A kernel of Apple's that uses atomics and produces sensible numbers here is
+ * evidence that it ran and no evidence about atomicity: a sum written by
  * threads that never raced looks exactly like a sum written by threads that
- * did. Detecting a lost update needs the expected total to depend on every
- * thread having contributed -- which needs a kernel whose arithmetic is known,
- * i.e. one written for the purpose rather than one of Apple's. Until that
- * exists, a kernel that uses atomics and produces sensible numbers here is
- * evidence that it ran, and no evidence at all about atomicity.
+ * did. The kernel that can tell them apart is written for the purpose rather
+ * than Apple's -- tools/air/atomiccheck.py, which makes each thread report the
+ * value its own fetch_add returned, so the sixteen of them must be 0..15 with
+ * nothing repeated whatever order the threads ran in. Even that is only
+ * evidence of atomicity where the threads really do run at once, which here
+ * they need not.
  */
 #define GRID 4
 
@@ -284,8 +320,10 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
       if (r->index >= ARRAY_SIZE(bufs))
          continue;
       uint8_t *bits = calloc(1, bytes);
-      for (unsigned k = 0; k < bytes; k++)
-         bits[k] = pattern_byte(k);
+      unsigned from_file = fill_buffer(bits, bytes);
+      if (from_file)
+         printf("air_run: buffer at index %u, %u bytes, %u of them from "
+                "AIR_RUN_BUFFER\n", r->index, bytes, from_file);
 
       if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER) {
          struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
@@ -638,8 +676,7 @@ main(int argc, char **argv)
          continue;
       unsigned bytes = r->size ? r->size : 256;
       uint8_t *bits = malloc(bytes);
-      for (unsigned k = 0; k < bytes; k++)
-         bits[k] = pattern_byte(k);
+      unsigned from_file = fill_buffer(bits, bytes);
       struct pipe_resource *buf = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
                                                      PIPE_USAGE_DEFAULT, bytes);
       pipe_buffer_write(pipe, buf, 0, bytes, bits);
@@ -647,9 +684,15 @@ main(int argc, char **argv)
                                 &(struct pipe_constant_buffer){
                                    .buffer = buf, .buffer_size = bytes,
                                 });
-      printf("air_run: %s buffer at index %u, %u bytes of (i * 7 + 13) & 0xff\n",
-             r->kind == AIR_RESOURCE_CONSTANT_BUFFER ? "constant" : "device",
-             r->index, bytes);
+      if (from_file)
+         printf("air_run: %s buffer at index %u, %u bytes, %u of them from "
+                "AIR_RUN_BUFFER\n",
+                r->kind == AIR_RESOURCE_CONSTANT_BUFFER ? "constant" : "device",
+                r->index, bytes, from_file);
+      else
+         printf("air_run: %s buffer at index %u, %u bytes of (i * 7 + 13) & 0xff\n",
+                r->kind == AIR_RESOURCE_CONSTANT_BUFFER ? "constant" : "device",
+                r->index, bytes);
       free(bits);
    }
 

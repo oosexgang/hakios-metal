@@ -186,8 +186,27 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_fdiv(&c->b, a[0], a[1]);
    } else if (!strcmp(op, "saturate") || !strcmp(op, "fast_saturate")) {
       r = nir_fsat(&c->b, a[0]);
+   } else if (!strcmp(op, "sign") && is_float) {
+      /* Metal's sign is OpenCL's: sign(-0) is -0, sign(+0) is +0, sign(NaN)
+       * is +0. nir_fsign will not promise that -- its own documentation says
+       * that for a zero source "there is a preference for the result to have
+       * the same sign, but this is not required (it is required by OpenCL)",
+       * and likewise for NaN. A backend is therefore licensed to lose it, and
+       * softpipe does: it answered +0 for -0 where NIR's own constant folder
+       * answered -0, so folding the shader could never have shown this.
+       *
+       * Built from comparisons instead, which promise what Metal needs:
+       * +1 where positive, -1 where negative, 0 for NaN because neither
+       * comparison holds, and a zero handed back as it came so it keeps its
+       * sign. No immediate is replicated, so this is the same for a vector.
+       */
+      nir_def *x = a[0];
+      nir_def *pos = nir_b2fN(&c->b, nir_fgt_imm(&c->b, x, 0.0), x->bit_size);
+      nir_def *neg = nir_b2fN(&c->b, nir_flt_imm(&c->b, x, 0.0), x->bit_size);
+      r = nir_bcsel(&c->b, nir_feq_imm(&c->b, x, 0.0), x,
+                    nir_fsub(&c->b, pos, neg));
    } else if (!strcmp(op, "sign")) {
-      r = is_float ? nir_fsign(&c->b, a[0]) : nir_isign(&c->b, a[0]);
+      r = nir_isign(&c->b, a[0]);   /* the float case is above */
    } else if (!strcmp(op, "mix")) {
       /* mix(x, y, a) = x + a * (y - x), and that is what Metal defines */
       r = nir_fadd(&c->b, a[0],
@@ -320,6 +339,27 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
                        p.class == AIR_PTR_SHARED ? "threadgroup" : "device");
 
    nir_def *off = p.offset ? p.offset : nir_imm_int(&c->b, 0);
+
+   /* The memory order, which this lowering is right for exactly one value of.
+    * That argument is Metal's memory_order, and every atomic in the corpus
+    * passes 0 -- memory_order_relaxed. A relaxed load or store of an aligned
+    * 32-bit word is a plain load or store, which is what happens below, and a
+    * relaxed read-modify-write needs no barrier either. A stronger order would
+    * need one that is not emitted, so rather than ignore the argument and be
+    * quietly wrong on a shader that asks for more, refuse it by name. Read
+    * through air_const_uint because a zero arrives as CST_CODE_NULL about as
+    * often as as an integer.
+    */
+   unsigned iorder = !strcmp(op, "load") ? 2 : 3;
+   uint64_t order;
+   if (in->num_operands <= iorder ||
+       !air_const_uint(in->operands[iorder], &order))
+      return air_error(c, "intrinsic: air.atomic.%s.%s with a memory order that is "
+                          "not a constant", where, op);
+   if (order != 0)
+      return air_error(c, "intrinsic: air.atomic.%s.%s with memory_order %u; only "
+                          "relaxed (0) is translated, and a stronger one needs a "
+                          "barrier this does not emit", where, op, (unsigned)order);
 
    if (!strcmp(op, "load")) {
       nir_def *r = air_load_ptr(c, p, in->base.type, 0);
