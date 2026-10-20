@@ -249,7 +249,22 @@ static void
 finalize_for_gallium(nir_shader *nir)
 {
    NIR_PASS(_, nir, nir_lower_system_values);
-   NIR_PASS(_, nir, nir_lower_compute_system_values, NULL);
+   /* An options struct of all-false and not NULL, which are not the same thing
+    * here and the difference is a trap. nir_lower_system_values *introduces*
+    * load_base_workgroup_id when it lowers SYSTEM_VALUE_WORKGROUP_ID, and the
+    * only thing that removes it again is
+    *
+    *     if (options && !options->has_base_workgroup_id)
+    *        return nir_imm_zero(...);
+    *
+    * so NULL reads as "the driver has base workgroup ids" -- the opposite of
+    * what a harness wants -- and the intrinsic survives into the backend. With
+    * softpipe that is an assertion in nir_to_tgsi rather than a message, and it
+    * stopped every kernel that asks for its workgroup id. Zero is also the
+    * right answer here: this dispatches one workgroup from the origin.
+    */
+   static const nir_lower_compute_system_values_options cs_options = { 0 };
+   NIR_PASS(_, nir, nir_lower_compute_system_values, &cs_options);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, 0);
 }
@@ -281,6 +296,95 @@ finalize_for_gallium(nir_shader *nir)
  * they need not.
  */
 #define GRID 4
+
+#define MAX_IMG 16
+
+/* The shape of each image a kernel touches, read off the intrinsics the
+ * frontend emitted rather than off the Metal type name.
+ *
+ * air.read_texture_* and air.write_texture_* become nir_image_load and
+ * nir_image_store (air_intrinsics.c), not texture instructions, so they want
+ * PIPE_BIND_SHADER_IMAGE and set_shader_images and not a sampler view -- which
+ * is why the draw path's texture code cannot simply be reused here.
+ *
+ * Per binding and not one format for the kernel: BlitLumaKernel_Unorm reads a
+ * uint image and writes a half one, so a single format would be right for one
+ * of its two images and quietly wrong for the other. The binding is src[0] and
+ * the frontend always emits it as an immediate, so it can be read here.
+ */
+static void
+image_shapes(nir_shader *cs, enum pipe_format fmt[MAX_IMG], bool isf[MAX_IMG],
+             enum glsl_sampler_dim dim[MAX_IMG], bool seen[MAX_IMG], unsigned *num)
+{
+   nir_foreach_function_impl(impl, cs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            nir_alu_type t;
+            if (in->intrinsic == nir_intrinsic_image_load)
+               t = nir_intrinsic_dest_type(in);
+            else if (in->intrinsic == nir_intrinsic_image_store)
+               t = nir_intrinsic_src_type(in);
+            else
+               continue;
+            if (!nir_src_is_const(in->src[0]))
+               continue;   /* a computed binding; refused by the caller's count */
+            unsigned b = nir_src_as_uint(in->src[0]);
+            if (b >= MAX_IMG || seen[b])
+               continue;
+            switch (nir_alu_type_get_base_type(t)) {
+            case nir_type_int:
+               fmt[b] = PIPE_FORMAT_R32G32B32A32_SINT; isf[b] = false; break;
+            case nir_type_uint:
+               fmt[b] = PIPE_FORMAT_R32G32B32A32_UINT; isf[b] = false; break;
+            default:
+               fmt[b] = PIPE_FORMAT_R32G32B32A32_FLOAT; isf[b] = true; break;
+            }
+            dim[b] = nir_intrinsic_image_dim(in);
+            seen[b] = true;
+            *num = MAX2(*num, b + 1);
+         }
+      }
+   }
+}
+
+/* The same, for the read-only textures a kernel fetches from. A texture is an
+ * AIR_RESOURCE_IMAGE only when it is written (air_to_nir.c): a read-only one
+ * stays a texture and Metal's read() on it becomes a txf, a texture fetch, so
+ * it needs a sampler view even inside a compute shader. BlitKernel_Unorm has
+ * one of each -- a txf from its source and an image_store to its destination --
+ * and binding only the image left the fetch reading nothing.
+ */
+static void
+texture_shapes(nir_shader *cs, enum pipe_format fmt[MAX_IMG], bool isf[MAX_IMG],
+               enum glsl_sampler_dim dim[MAX_IMG], bool seen[MAX_IMG], unsigned *num)
+{
+   nir_foreach_function_impl(impl, cs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *t = nir_instr_as_tex(instr);
+            unsigned b = t->texture_index;
+            if (b >= MAX_IMG || seen[b])
+               continue;
+            switch (nir_alu_type_get_base_type(t->dest_type)) {
+            case nir_type_int:
+               fmt[b] = PIPE_FORMAT_R32G32B32A32_SINT; isf[b] = false; break;
+            case nir_type_uint:
+               fmt[b] = PIPE_FORMAT_R32G32B32A32_UINT; isf[b] = false; break;
+            default:
+               fmt[b] = PIPE_FORMAT_R32G32B32A32_FLOAT; isf[b] = true; break;
+            }
+            dim[b] = t->sampler_dim;
+            seen[b] = true;
+            *num = MAX2(*num, b + 1);
+         }
+      }
+   }
+}
 
 static int
 dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
@@ -314,6 +418,10 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
    struct pipe_resource *bufs[32] = { 0 };
    unsigned sizes[32] = { 0 };
    bool writable[32] = { false };
+   bool img_read[MAX_IMG] = { false }, img_write[MAX_IMG] = { false };
+   unsigned num_img = 0;
+   bool tex_used[MAX_IMG] = { false };
+   unsigned num_tex = 0;
    unsigned num_ssbo = 0, num_written = 0;
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
@@ -341,17 +449,34 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
          writable[r->index] = r->write;
          num_ssbo = MAX2(num_ssbo, r->index + 1);
          num_written += r->write ? 1 : 0;
-      } else if (r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_IMAGE) {
-         free(bits);
-         fprintf(stderr, "air_run: %s uses a texture or an image; this harness binds those "
-                         "for a draw and not yet for a dispatch\n", name);
-         return 1;
+      } else if (r->kind == AIR_RESOURCE_IMAGE) {
+         if (r->index >= MAX_IMG) {
+            free(bits);
+            fprintf(stderr, "air_run: %s binds an image at %u, past the %u this harness "
+                            "keeps room for\n", name, r->index, MAX_IMG);
+            return 1;
+         }
+         img_read[r->index] = r->read;
+         img_write[r->index] = r->write;
+         num_img = MAX2(num_img, r->index + 1);
+      } else if (r->kind == AIR_RESOURCE_TEXTURE) {
+         if (r->index >= MAX_IMG) {
+            free(bits);
+            fprintf(stderr, "air_run: %s binds a texture at %u, past the %u this harness "
+                            "keeps room for\n", name, r->index, MAX_IMG);
+            return 1;
+         }
+         tex_used[r->index] = true;
+         num_tex = MAX2(num_tex, r->index + 1);
       }
       free(bits);
    }
-   if (!num_written) {
-      fprintf(stderr, "air_run: %s writes no device buffer, so a dispatch would leave "
-                      "nothing to read back\n", name);
+   unsigned num_img_written = 0;
+   for (unsigned i = 0; i < num_img; i++)
+      num_img_written += img_write[i] ? 1 : 0;
+   if (!num_written && !num_img_written) {
+      fprintf(stderr, "air_run: %s writes no device buffer and no image, so a dispatch "
+                      "would leave nothing to read back\n", name);
       return 1;
    }
 
@@ -364,6 +489,143 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
          mask |= 1u << i;
    }
    pipe->set_shader_buffers(pipe, PIPE_SHADER_COMPUTE, 0, num_ssbo, sb, mask);
+
+   /* The images, one resource each, with the format the kernel's own intrinsics
+    * declare. A readable one is filled with the same texel pattern the draw
+    * path uses -- texel (x,y,z) of slot n is (100+x+1000n, 200+y, 300+x+y+z,
+    * 400) -- so that a kernel reading the wrong slot or the wrong texel cannot
+    * come back with the right answer. A write-only one is left as the pattern
+    * bytes so that a kernel which writes nothing is distinguishable from one
+    * that writes zeros.
+    */
+   enum pipe_format ifmt[MAX_IMG];
+   bool iisf[MAX_IMG];
+   enum glsl_sampler_dim idim[MAX_IMG];
+   bool iseen[MAX_IMG] = { false };
+   unsigned nshape = 0;
+   for (unsigned i = 0; i < MAX_IMG; i++) {
+      ifmt[i] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      iisf[i] = true;
+      idim[i] = GLSL_SAMPLER_DIM_2D;
+   }
+   image_shapes(cs, ifmt, iisf, idim, iseen, &nshape);
+   struct pipe_resource *imgs[MAX_IMG] = { 0 };
+   struct pipe_image_view ivs[MAX_IMG] = { 0 };
+   for (unsigned i = 0; i < num_img; i++) {
+      if (idim[i] != GLSL_SAMPLER_DIM_2D && idim[i] != GLSL_SAMPLER_DIM_3D) {
+         fprintf(stderr, "air_run: %s uses an image of a kind this harness does not bind "
+                         "(dim %u at %u)\n", name, idim[i], i);
+         return 1;
+      }
+      unsigned depth = idim[i] == GLSL_SAMPLER_DIM_3D ? TEX_SIZE : 1;
+      struct pipe_resource itempl = {
+         .target = idim[i] == GLSL_SAMPLER_DIM_3D ? PIPE_TEXTURE_3D : PIPE_TEXTURE_2D,
+         .format = ifmt[i],
+         .width0 = TEX_SIZE, .height0 = TEX_SIZE, .depth0 = depth, .array_size = 1,
+         .bind = PIPE_BIND_SHADER_IMAGE | PIPE_BIND_SAMPLER_VIEW,
+      };
+      imgs[i] = screen->resource_create(screen, &itempl);
+      if (!imgs[i]) {
+         fprintf(stderr, "air_run: the driver would not make image %u (%s)\n", i,
+                 util_format_short_name(ifmt[i]));
+         return 1;
+      }
+      float texels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+      int32_t itexels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+      for (unsigned z = 0; z < depth; z++)
+         for (unsigned y = 0; y < TEX_SIZE; y++)
+            for (unsigned x = 0; x < TEX_SIZE; x++) {
+               unsigned k = ((z * TEX_SIZE + y) * TEX_SIZE + x) * 4;
+               texel_value(i, x, y, z, &texels[k]);
+               for (unsigned c = 0; c < 4; c++)
+                  itexels[k + c] = (int32_t)texels[k + c];
+            }
+      struct pipe_box box = { .width = TEX_SIZE, .height = TEX_SIZE, .depth = depth };
+      pipe->texture_subdata(pipe, imgs[i], 0, PIPE_MAP_WRITE, &box,
+                            iisf[i] ? (const void *)texels : (const void *)itexels,
+                            TEX_SIZE * 4 * sizeof(float),
+                            TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+      ivs[i] = (struct pipe_image_view){
+         .resource = imgs[i],
+         .format = ifmt[i],
+         .access = (img_read[i] ? PIPE_IMAGE_ACCESS_READ : 0) |
+                   (img_write[i] ? PIPE_IMAGE_ACCESS_WRITE : 0),
+         .shader_access = (img_read[i] ? PIPE_IMAGE_ACCESS_READ : 0) |
+                          (img_write[i] ? PIPE_IMAGE_ACCESS_WRITE : 0),
+         .u.tex.level = 0, .u.tex.first_layer = 0,
+         .u.tex.last_layer = depth - 1,
+      };
+   }
+   if (num_img)
+      pipe->set_shader_images(pipe, PIPE_SHADER_COMPUTE, 0, num_img, 0, ivs);
+
+   /* and the read-only textures, as sampler views with the same texel pattern */
+   enum pipe_format tfmt[MAX_IMG];
+   bool tisf[MAX_IMG];
+   enum glsl_sampler_dim tdim[MAX_IMG];
+   bool tseen[MAX_IMG] = { false };
+   unsigned ntshape = 0;
+   for (unsigned i = 0; i < MAX_IMG; i++) {
+      tfmt[i] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      tisf[i] = true;
+      tdim[i] = GLSL_SAMPLER_DIM_2D;
+   }
+   texture_shapes(cs, tfmt, tisf, tdim, tseen, &ntshape);
+   struct pipe_resource *texes[MAX_IMG] = { 0 };
+   struct pipe_sampler_view *views[MAX_IMG] = { 0 };
+   void *csampler = NULL;
+   for (unsigned i = 0; i < num_tex; i++) {
+      if (!tex_used[i])
+         continue;
+      if (tdim[i] != GLSL_SAMPLER_DIM_2D && tdim[i] != GLSL_SAMPLER_DIM_3D) {
+         fprintf(stderr, "air_run: %s fetches a texture of a kind this harness does not "
+                         "bind (dim %u at %u)\n", name, tdim[i], i);
+         return 1;
+      }
+      unsigned depth = tdim[i] == GLSL_SAMPLER_DIM_3D ? TEX_SIZE : 1;
+      struct pipe_resource ttempl = {
+         .target = tdim[i] == GLSL_SAMPLER_DIM_3D ? PIPE_TEXTURE_3D : PIPE_TEXTURE_2D,
+         .format = tfmt[i],
+         .width0 = TEX_SIZE, .height0 = TEX_SIZE, .depth0 = depth, .array_size = 1,
+         .bind = PIPE_BIND_SAMPLER_VIEW,
+      };
+      texes[i] = screen->resource_create(screen, &ttempl);
+      if (!texes[i]) {
+         fprintf(stderr, "air_run: the driver would not make texture %u (%s)\n", i,
+                 util_format_short_name(tfmt[i]));
+         return 1;
+      }
+      float texels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+      int32_t itexels[TEX_SIZE * TEX_SIZE * TEX_SIZE * 4];
+      for (unsigned z = 0; z < depth; z++)
+         for (unsigned y = 0; y < TEX_SIZE; y++)
+            for (unsigned x = 0; x < TEX_SIZE; x++) {
+               unsigned k = ((z * TEX_SIZE + y) * TEX_SIZE + x) * 4;
+               texel_value(i, x, y, z, &texels[k]);
+               for (unsigned c = 0; c < 4; c++)
+                  itexels[k + c] = (int32_t)texels[k + c];
+            }
+      struct pipe_box tbox = { .width = TEX_SIZE, .height = TEX_SIZE, .depth = depth };
+      pipe->texture_subdata(pipe, texes[i], 0, PIPE_MAP_WRITE, &tbox,
+                            tisf[i] ? (const void *)texels : (const void *)itexels,
+                            TEX_SIZE * 4 * sizeof(float),
+                            TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+      struct pipe_sampler_view vtempl = { 0 };
+      u_sampler_view_default_template(&vtempl, texes[i], texes[i]->format);
+      views[i] = pipe->create_sampler_view(pipe, texes[i], &vtempl);
+   }
+   if (num_tex) {
+      csampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
+         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+         .unnormalized_coords = 1 });
+      pipe->bind_sampler_states(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, &csampler);
+      pipe->set_sampler_views(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, 0, false, views);
+   }
 
    void *cso = pipe->create_compute_state(pipe, &(struct pipe_compute_state){
       .ir_type = PIPE_SHADER_IR_NIR, .prog = cs,
@@ -383,6 +645,10 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
    printf("air_run: dispatching %ux%ux1 threads in one workgroup; %u device buffer%s bound, "
           "%u of them written, filled with (i * 7 + 13) & 0xff\n",
           GRID, GRID, num_ssbo, num_ssbo == 1 ? "" : "s", num_written);
+   if (num_img)
+      printf("air_run: %u image%s bound (%u written), %ux%u, texel (x,y,z) of slot n = "
+             "(100+x+1000n, 200+y, 300+x+y+z, 400)\n", num_img, num_img == 1 ? "" : "s",
+             num_img_written, TEX_SIZE, TEX_SIZE);
    pipe->launch_grid(pipe, &grid);
    pipe->flush(pipe, NULL, 0);
 
@@ -400,6 +666,38 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
       for (unsigned w = 0; w < words; w++)
          printf("  [%2u] %11u  0x%08x\n", w, p[w], p[w]);
       pipe_buffer_unmap(pipe, xfer);
+   }
+
+   /* and every image the kernel wrote: without this a dispatch that writes only
+    * an image -- which is most of the corpus's kernels -- would have nothing to
+    * read back, and air_run would have reported a successful run of something
+    * it had not looked at.
+    */
+   for (unsigned i = 0; i < num_img; i++) {
+      if (!img_write[i])
+         continue;
+      struct pipe_transfer *xfer;
+      unsigned depth = idim[i] == GLSL_SAMPLER_DIM_3D ? TEX_SIZE : 1;
+      void *pix = pipe->texture_map(pipe, imgs[i], 0, PIPE_MAP_READ,
+                                    &(struct pipe_box){ .width = TEX_SIZE,
+                                                        .height = TEX_SIZE,
+                                                        .depth = depth }, &xfer);
+      if (!pix) {
+         fprintf(stderr, "air_run: image %u could not be read back\n", i);
+         return 1;
+      }
+      printf("air_run: image %u after the dispatch, texels (0,0) and (1,1):\n", i);
+      for (unsigned t = 0; t < 2; t++) {
+         unsigned x = t, y = t;
+         for (unsigned c = 0; c < 4; c++) {
+            unsigned k = (y * (xfer->stride / (4 * sizeof(float))) + x) * 4 + c;
+            if (iisf[i])
+               printf("  (%u,%u)[%u] %.9g\n", x, y, c, (double)((float *)pix)[k]);
+            else
+               printf("  (%u,%u)[%u] %11d\n", x, y, c, ((int32_t *)pix)[k]);
+         }
+      }
+      pipe->texture_unmap(pipe, xfer);
    }
 
    pipe->destroy(pipe);
