@@ -417,14 +417,31 @@ main(int argc, char **argv)
     * creation, so it has to be set before the screen is made.
     */
    bool want_disasm = false;
-   if (argc > 1 && !strcmp(argv[1], "--disasm")) {
-      want_disasm = true;
-      setenv("IR3_SHADER_DEBUG", "disasm", 1);
-      argv++;
-      argc--;
+   /* --buffer FILE is AIR_RUN_BUFFER as an argument, and it exists because the
+    * device has no shell to set one with. iOS 16.5's own root carries no sh at
+    * all -- /bin holds df and ps -- and the job list that runs this is read by
+    * our init, which splits a line on blanks and has no notion of a variable
+    * (userland/src/init.c, run_command). So a generated suite whose every
+    * module reads its own bytes could not be run on the phone until this
+    * option existed: with it each module is one ordinary job line.
+    */
+   while (argc > 1 && argv[1][0] == '-') {
+      if (!strcmp(argv[1], "--disasm")) {
+         want_disasm = true;
+         setenv("IR3_SHADER_DEBUG", "disasm", 1);
+         argv++;
+         argc--;
+      } else if (!strcmp(argv[1], "--buffer") && argc > 2) {
+         setenv("AIR_RUN_BUFFER", argv[2], 1);
+         argv += 2;
+         argc -= 2;
+      } else {
+         break;
+      }
    }
    if (argc < 2) {
-      fprintf(stderr, "usage: air_run [--disasm] FILE[.metallib] [FUNCTION]\n");
+      fprintf(stderr, "usage: air_run [--disasm] [--buffer FILE] "
+                      "FILE[.metallib] [FUNCTION]\n");
       return 2;
    }
 
