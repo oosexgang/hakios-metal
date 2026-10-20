@@ -1147,10 +1147,12 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             /* The mask is an aggregate rather than plain data whenever a lane
              * is poison, so <i32 0, i32 poison, ...> -- what a Metal
              * half2-to-half4 widening compiles to -- mixes LLVM's two
-             * spellings of a constant integer. air_const_as_uint reads both.
+             * spellings of a constant integer. air_const_uint reads both; this
+             * code used to test ckind == AIR_CONST_INT by hand instead, which
+             * is the whole bug.
              */
             uint64_t lane = 0;
-            bool have = e && air_const_as_uint(e, &lane);
+            bool have = air_const_uint(mk->elems[i], &lane);
             if (!e || (!have && e->ckind != AIR_CONST_UNDEF &&
                        e->ckind != AIR_CONST_POISON))
                return air_error(c, "instruction: element %u of a shuffle mask is %s",
@@ -1593,6 +1595,108 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    return true;
 }
 
+/* An air.visible library function, inside an entry point we generate for it.
+ *
+ * A library function is not a shader. Metal links one into a caller at
+ * pipeline time through the ABI its own metadata describes -- air.stitching_info
+ * names the four functions that do it (load_argument, copy_from_buffer,
+ * store_return_value, destroy) and gives each argument's size and alignment --
+ * and none of that is implemented here: it belongs to the runtime, not to the
+ * compiler. So 135 modules of the corpus, a third of it, had nothing that
+ * could be dispatched and were counted only as refused.
+ *
+ * This wraps one instead: argument i is read from device buffer 0 at byte
+ * 16*i, the function is called, and the return value is written to device
+ * buffer 1 at offset 0, by a single thread. The 16-byte slot is Apple's own
+ * size and alignment for a float4 (the air.vector_type node beside each
+ * stitching argument says 16 and 16), and a fixed slot makes the layout
+ * derivable from the signature alone -- which is what lets a harness on this
+ * machine fill the same bytes and compare the result.
+ *
+ * What that measures is the body: its arithmetic, its control flow, its calls.
+ * What it does not touch is the stitching ABI, so a wrapped function is
+ * reported in a row of its own and never counted among the corpus's entry
+ * points.
+ */
+static bool
+wrap_library_function(struct air_ctx *c, const struct air_md *out_md)
+{
+   const struct air_function *f = c->fn;
+
+   /* The result buffer carries the function's own air.arg_type_name ("float4"
+    * and the like, from air.visible_output): a harness that fills the argument
+    * buffer has to know how to read the bytes that come back, and Apple's name
+    * for the type is a better source for that than our reading of the LLVM
+    * type -- the two can then be checked against each other.
+    */
+   add_resource(c, AIR_RESOURCE_DEVICE_BUFFER, 0, 16 * MAX2(f->num_args, 1),
+                true, false, ~0u, NULL);
+   add_resource(c, AIR_RESOURCE_DEVICE_BUFFER, 1, 16, false, true, ~0u, out_md);
+
+   struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *,
+                                         MAX2(f->num_args, 1));
+   bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
+
+   for (unsigned i = 0; i < f->num_args; i++) {
+      const struct air_type *t = f->args[i].type;
+      const struct air_type *e = t->kind == AIR_TYPE_VECTOR ? t->elem : t;
+      bool numeric = e && (e->kind == AIR_TYPE_FLOAT || e->kind == AIR_TYPE_HALF ||
+                           e->kind == AIR_TYPE_INT);
+      if (!numeric || (t->kind != AIR_TYPE_VECTOR && t->kind != AIR_TYPE_FLOAT &&
+                       t->kind != AIR_TYPE_HALF && t->kind != AIR_TYPE_INT))
+         return air_error(c, "library: argument %u is neither a scalar nor a vector, "
+                             "and this wrapper passes each argument in a 16-byte slot "
+                             "of one buffer", i);
+      if (air_nir_components(t) * air_nir_bit_size(c, t) > 16 * 8)
+         return air_error(c, "library: argument %u does not fit the wrapper's 16-byte "
+                             "slot", i);
+
+      struct air_ptr p = { .class = AIR_PTR_SSBO, .binding = 0, .pointee = t };
+      nir_def *v = air_load_ptr(c, air_ptr_add(c, p, nir_imm_int(&c->b, 16 * i)), t, 16);
+      if (!v)
+         return false;
+      argv[i] = air_val_ssa(c, v);
+      is_param[i] = true;
+   }
+
+   const struct air_type *rt = f->fn_type->elem;
+   const struct air_type *re = rt && rt->kind == AIR_TYPE_VECTOR ? rt->elem : rt;
+   if (!rt || rt->kind == AIR_TYPE_VOID)
+      return air_error(c, "library: the function returns nothing, so a wrapper would "
+                          "have nothing to write");
+   if (!re || (re->kind != AIR_TYPE_FLOAT && re->kind != AIR_TYPE_HALF &&
+               re->kind != AIR_TYPE_INT))
+      return air_error(c, "library: the return value is neither a scalar nor a vector");
+
+   nir_function *fn = translate_callee(c, f, argv, is_param);
+   if (!fn)
+      return false;   /* translate_callee has said why */
+
+   unsigned bits = air_nir_bit_size(c, rt);
+   unsigned comps = air_nir_components(rt);
+   const struct glsl_type *gt =
+      glsl_vector_type(bits == 16 ? GLSL_TYPE_FLOAT16 :
+                       bits == 64 ? GLSL_TYPE_UINT64 : GLSL_TYPE_UINT, comps);
+   nir_variable *tmp = nir_local_variable_create(c->b.impl, gt, "libret");
+
+   nir_call_instr *call = nir_call_instr_create(c->nir, fn);
+   unsigned idx = 0;
+   call->params[idx++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, tmp)->def);
+   for (unsigned i = 0; i < f->num_args; i++)
+      call->params[idx++] = nir_src_for_ssa(argv[i]->def);
+   nir_builder_instr_insert(&c->b, &call->instr);
+
+   struct air_ptr out = { .class = AIR_PTR_SSBO, .binding = 1, .pointee = rt };
+   if (!air_store_ptr(c, out, nir_load_var(&c->b, tmp), 16))
+      return false;
+
+   /* the generated block ends the way a translated one does: this impl is
+    * unstructured until nir_lower_goto_ifs runs over it
+    */
+   nir_goto(&c->b, c->b.impl->end_block);
+   return true;
+}
+
 static bool
 translate_body(struct air_ctx *c)
 {
@@ -1912,14 +2016,22 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       ralloc_free(ctx);
       return NULL;
    }
+   /* air.visible: a library function, linked into its caller at pipeline time
+    * (docs/air.md section 7.5). Not an entry point, so not a shader -- unless
+    * the caller asks for the generated wrapper, which makes one compute shader
+    * whose only job is to call it (wrap_library_function).
+    */
+   bool wrap = false;
    if (stage == MESA_SHADER_NONE) {
-      /* air.visible: a library function, linked into its caller at pipeline
-       * time (docs/air.md section 7.5). Not an entry point, so not a shader.
-       */
-      if (error)
-         *error = ralloc_strdup(mem_ctx, "stage: air.visible, a library function (not yet)");
-      ralloc_free(ctx);
-      return NULL;
+      if (!options || !options->library_wrapper) {
+         if (error)
+            *error = ralloc_strdup(mem_ctx,
+                                   "stage: air.visible, a library function (not yet)");
+         ralloc_free(ctx);
+         return NULL;
+      }
+      stage = MESA_SHADER_COMPUTE;
+      wrap = true;
    }
 
    if (!entry->num_ops || !entry->ops[0] || entry->ops[0]->kind != AIR_MD_VALUE ||
@@ -1965,10 +2077,15 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    c.info->stage = stage;
    c.info->entry_point = fn->base.name;
 
-   /* the outputs: fields of the returned struct, in order */
-   const struct air_md *out_node = entry->num_ops > 1 ? entry->ops[1] : NULL;
+   /* the outputs: fields of the returned struct, in order. A wrapped library
+    * function has none of this: its result is a value the wrapper stores to a
+    * buffer, not a shader output, and its own metadata uses air.visible_input
+    * and air.visible_output rather than the keys translate_input reads.
+    */
+   const struct air_md *out_node = (!wrap && entry->num_ops > 1) ? entry->ops[1] : NULL;
    const struct air_type *rt = fn->fn_type->elem;
-   unsigned num_fields = rt->kind == AIR_TYPE_STRUCT ? rt->num_members :
+   unsigned num_fields = wrap ? 0 :
+                         rt->kind == AIR_TYPE_STRUCT ? rt->num_members :
                          rt->kind == AIR_TYPE_VOID ? 0 : 1;
    c.num_outputs = num_fields;
    c.outputs = rzalloc_array(ctx, __typeof__(*c.outputs), MAX2(num_fields, 1));
@@ -1989,12 +2106,12 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    }
 
    /* the inputs */
-   const struct air_md *in_node = entry->num_ops > 2 ? entry->ops[2] : NULL;
+   const struct air_md *in_node = (!wrap && entry->num_ops > 2) ? entry->ops[2] : NULL;
    for (unsigned i = 0; i < (in_node ? in_node->num_ops : 0) && !c.error[0]; i++)
       translate_input(&c, in_node->ops[i], &next_in_varying);
 
    /* the entry point's parameters, as the body will read them */
-   for (unsigned i = 0; i < c.num_params && !c.error[0]; i++) {
+   for (unsigned i = 0; i < (wrap ? 0 : c.num_params) && !c.error[0]; i++) {
       if (c.params[i])
          air_set(&c, &fn->args[i], c.params[i]);
       else
@@ -2008,8 +2125,17 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    if (!c.error[0])
       run_static_initializers(&c);
 
-   if (!c.error[0])
-      translate_body(&c);
+   if (!c.error[0]) {
+      if (wrap) {
+         /* air.visible's second operand is the result node, whose one entry
+          * carries air.visible_output and the type's name
+          */
+         const struct air_md *rn = entry->num_ops > 1 ? entry->ops[1] : NULL;
+         wrap_library_function(&c, rn && rn->num_ops ? rn->ops[0] : NULL);
+      }
+      else
+         translate_body(&c);
+   }
 
    if (c.error[0]) {
       if (error)

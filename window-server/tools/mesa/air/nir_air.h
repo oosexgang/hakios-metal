@@ -101,6 +101,17 @@ struct air_constant_value {
 struct air_to_nir_options {
    const struct air_constant_value *constants;
    unsigned num_constants;
+
+   /* Translate an air.visible library function by generating an entry point
+    * that calls it: argument i read from device buffer 0 at byte 16*i, the
+    * return value written to device buffer 1 at offset 0, one thread. Metal's
+    * own way of using these functions is to stitch them into a caller at
+    * pipeline time (air.stitching_info in their metadata), which this frontend
+    * does not implement; the wrapper exists so that a library function's body
+    * can be run and compared at all. A shader produced this way is not an
+    * entry point of the corpus and is counted separately.
+    */
+   bool library_wrapper;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

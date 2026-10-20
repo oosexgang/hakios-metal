@@ -410,9 +410,8 @@ barrier_op(struct air_ctx *c, const struct air_inst *in)
     * ever passes 2 with scope 1 (the threadgroup).
     */
    uint64_t flags = 2;
-   const struct air_constant *k =
-      in->num_operands > 1 ? air_value_as_constant(in->operands[1]) : NULL;
-   air_const_as_uint(k, &flags); /* leaves flags alone when it is not readable */
+   if (in->num_operands > 1)
+      air_const_uint(in->operands[1], &flags); /* left alone when not readable */
 
    nir_variable_mode modes = 0;
    if (flags & 1)
@@ -441,13 +440,12 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       /* a copy between two of our pointers, of a constant length */
       struct air_val *dst = air_get(c, in->operands[1]);
       struct air_val *src = air_get(c, in->operands[2]);
-      const struct air_constant *len = air_value_as_constant(in->operands[3]);
       if (!dst || !src)
          return false;
       if (dst->kind != AIR_VAL_PTR || src->kind != AIR_VAL_PTR)
          return air_error(c, "intrinsic: memcpy that is not between pointers");
       uint64_t bytes;
-      if (!air_const_as_uint(len, &bytes))
+      if (!air_const_uint(in->operands[3], &bytes))
          return air_error(c, "intrinsic: memcpy of a run-time length");
       /* in 4-byte pieces, which is what every memcpy in the corpus is a
        * multiple of (they copy float vectors out of constant buffers)
@@ -467,13 +465,12 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
    if (!strncmp(name, "llvm.memset.", 12)) {
       struct air_val *dst = air_get(c, in->operands[1]);
       nir_def *byte = air_get_ssa(c, in->operands[2]);
-      const struct air_constant *len = air_value_as_constant(in->operands[3]);
       if (!dst || !byte)
          return false;
       if (dst->kind != AIR_VAL_PTR)
          return air_error(c, "intrinsic: memset of something that is not a pointer");
       uint64_t bytes;
-      if (!air_const_as_uint(len, &bytes) || bytes % 4)
+      if (!air_const_uint(in->operands[3], &bytes) || bytes % 4)
          return air_error(c, "intrinsic: memset of a length that is not a multiple of 4");
       if (!nir_src_is_const(nir_src_for_ssa(byte)))
          return air_error(c, "intrinsic: memset of a run-time byte");
