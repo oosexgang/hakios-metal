@@ -85,6 +85,24 @@ struct air_ctx {
    struct hash_table *fns;
    nir_deref_instr *ret_deref;
 
+   /* What each module global resolves to, decided once (plan_globals) and
+    * turned into a value in whichever function needs it (materialise_globals).
+    * The two are separate because the deciding half has side effects that must
+    * happen once -- it appends inline samplers to info->resources and lays out
+    * shared and scratch memory -- while the making half emits an nir_def for
+    * the byte offset, and a def belongs to the impl that created it. Copying
+    * the entry point's values into a callee instead left the callee using the
+    * caller's defs, which is a cross-function def/use: nir_repair_ssa then
+    * asks the wrong function for its dominance metadata and asserts.
+    */
+   struct air_global_plan {
+      enum air_ptr_class class;
+      unsigned binding;
+      unsigned offset;      /* bytes, when has_offset */
+      bool has_offset;
+      bool skip;            /* llvm.* lists, and anything that failed */
+   } *global_plan;
+
    /* what the entry point's parameters are */
    unsigned num_params;
    struct air_val **params;
