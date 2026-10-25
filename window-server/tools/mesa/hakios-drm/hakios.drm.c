@@ -16,9 +16,9 @@
 
 #include "xf86drm.h"
 
-#define REDWOOD_GPU_SERVICE     "RedwoodGPU"
-#define REDWOOD_GPU_SURFACE     0x7e            /* the request that is not Linux's */
-#define REDWOOD_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
+#define HAKIOS_GPU_SERVICE     "HakiosGPU"
+#define HAKIOS_GPU_SURFACE     0x7e            /* the request that is not Linux's */
+#define HAKIOS_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 
 static io_connect_t connection;
 static int connection_fd = -1;
@@ -36,7 +36,7 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	if (connection_fd >= 0) {
 		return dup(connection_fd);
 	}
-	service = IOServiceGetMatchingService(0, IOServiceMatching(REDWOOD_GPU_SERVICE));
+	service = IOServiceGetMatchingService(0, IOServiceMatching(HAKIOS_GPU_SERVICE));
 	if (service == 0) {
 		return -1;
 	}
@@ -145,7 +145,7 @@ drmGetCap(int fd, uint64_t capability, uint64_t *value)
 }
 
 void *
-redwood_drm_map(int fd, uint32_t handle, uint64_t size)
+hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 {
 	mach_vm_address_t address = 0;
 	mach_vm_size_t mapped = 0;
@@ -164,20 +164,20 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 }
 
 void
-redwood_drm_unmap(int fd, uint32_t handle, void *address)
+hakios_drm_unmap(int fd, uint32_t handle, void *address)
 {
 	(void)fd;
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
 }
 
 int
-redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
+hakios_drm_surface(int fd, struct hakios_drm_surface *surface)
 {
 	int error;
 
 	(void)fd;
-	surface->handle = REDWOOD_GPU_DESCRIBE;
-	error = call(REDWOOD_GPU_SURFACE, surface, sizeof(*surface));
+	surface->handle = HAKIOS_GPU_DESCRIBE;
+	error = call(HAKIOS_GPU_SURFACE, surface, sizeof(*surface));
 	if (error != 0) {
 		errno = error;
 		return -1;
@@ -188,8 +188,8 @@ redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
 int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
-	struct redwood_drm_surface request = { .surface = (uint32_t)surface };
-	int error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
+	struct hakios_drm_surface request = { .surface = (uint32_t)surface };
+	int error = call(HAKIOS_GPU_SURFACE, &request, sizeof(request));
 
 	(void)fd;
 	if (error != 0) {

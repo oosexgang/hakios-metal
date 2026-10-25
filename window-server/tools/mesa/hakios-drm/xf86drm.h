@@ -1,12 +1,12 @@
 /*
  * What Mesa's freedreno takes from libdrm's xf86drm.h, for a system without Linux's DRM: the
- * declarations here, the functions in redwood_drm.c, which carry the requests to the kernel's
- * GPU driver (the service RedwoodGPU; iokit/Kernel/RedwoodGPU.cpp) as calls of its user client.
+ * declarations here, the functions in hakios.drm.c, which carry the requests to the kernel's
+ * GPU driver (the service HakiosGPU; iokit/Kernel/hakios.gpu.cpp) as calls of its user client.
  * tools/mk-mesa.sh puts both into Mesa's tree, where they are the "libdrm" freedreno is built
  * against. The request numbers and their structures are Linux's (Mesa's include/drm-uapi).
  */
-#ifndef REDWOOD_XF86DRM_H
-#define REDWOOD_XF86DRM_H
+#ifndef HAKIOS_XF86DRM_H
+#define HAKIOS_XF86DRM_H
 
 #include <fcntl.h>
 #include <stddef.h>
@@ -41,7 +41,7 @@ int drmGetCap(int fd, uint64_t capability, uint64_t *value);
 /*
  * Buffers and fences as file descriptors: there are none here. But memory that somebody else
  * has made does come in, as Linux's comes in by file descriptor: an IOSurface, by its ID, where
- * freedreno expects the descriptor (see redwood_drm_surface() below).
+ * freedreno expects the descriptor (see hakios_drm_surface() below).
  */
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
 int drmPrimeFDToHandle(int fd, int surface, uint32_t *handle);
@@ -54,23 +54,23 @@ int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
 int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
 
 /* Not libdrm's: a buffer's memory in this process, in place of mmap() on the device (freedreno_bo.c is patched to call these). */
-void *redwood_drm_map(int fd, uint32_t handle, uint64_t size);
-void redwood_drm_unmap(int fd, uint32_t handle, void *address);
+void *hakios_drm_map(int fd, uint32_t handle, uint64_t size);
+void hakios_drm_unmap(int fd, uint32_t handle, void *address);
 
 /*
  * Not libdrm's either: what the memory of an IOSurface would be like as a buffer (the kernel's
- * request and its answer: struct redwood_surface in iokit/Kernel/RedwoodGPU.cpp); 0, or -1 with
+ * request and its answer: struct hakios_surface in iokit/Kernel/hakios.gpu.cpp); 0, or -1 with
  * errno. The buffer itself is made by drmPrimeFDToHandle(), which freedreno calls with its
  * table of buffers locked, so that a buffer on its way out and the same surface on its way in
  * cannot pass each other.
  */
-struct redwood_drm_surface {
+struct hakios_drm_surface {
 	uint32_t surface;                       /* the IOSurface's ID */
 	uint32_t handle;                        /* (the kernel's: which of the two is asked) */
 	uint64_t size;                          /* back: how big the buffer is, */
 	uint32_t offset, row_bytes;             /* where the pixels start in it and how long a row of them is, */
 	uint32_t width, height, pixel_format, planes;   /* and what they are */
 };
-int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
+int hakios_drm_surface(int fd, struct hakios_drm_surface *surface);
 
 #endif

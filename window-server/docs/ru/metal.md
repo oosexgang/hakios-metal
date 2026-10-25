@@ -82,11 +82,11 @@ metal_test:   IOAcceleratorES "sgx": MetalPluginName (none), MetalPluginClassNam
 полминуты, и нарочно без двух свойств, чтобы и Metal, и OpenGL ES прошли мимо. Цепочка из раздела 1
 обрывается не на шаге 1, а на шаге 2.
 
-Adreno же отдаётся userland'у отдельно и под своим именем: `iokit/Kernel/RedwoodGPU.cpp`
-(строки 289–307) регистрирует `RedwoodGPU : IOService`, `setName("RedwoodGPU")`,
-`kIOUserClientClassKey = "RedwoodGPUUserClient"` — это то, с чем говорит freedreno из Mesa, и к
-`IOAcceleratorES` оно отношения не имеет. Причём `RedwoodGPUStart()` зовётся из
-`bsd/dev/redwood_adreno.c` (строка 3858) только когда GPU действительно поднялся, так что в QEMU
+Adreno же отдаётся userland'у отдельно и под своим именем: `iokit/Kernel/hakios.gpu.cpp`
+(строки 289–307) регистрирует `HakiosGPU : IOService`, `setName("HakiosGPU")`,
+`kIOUserClientClassKey = "HakiosGPUUserClient"` — это то, с чем говорит freedreno из Mesa, и к
+`IOAcceleratorES` оно отношения не имеет. Причём `HakiosGPUStart()` зовётся из
+`bsd/dev/hakios.adreno.c` (строка 3858) только когда GPU действительно поднялся, так что в QEMU
 `metal_test` и не нашёл ничего (`what the registry has that is a GPU: none`).
 
 **Что из этого следует для раздела 4.** Границу стерегут не IOKit и не ядро: класс нужной службы в
@@ -188,14 +188,14 @@ AGXA11FamilyDevice  ->  IOGPUMetalDevice (IOGPU.framework)  ->  _MTLDevice (Meta
 `IOGPUCommandQueueSubmitCommandBuffers`, разделяемая память, …). Для варианта (А) это и подарок, и
 счёт: подарок — что эти 711 методов писать не надо; счёт — что тогда **ядру порта придётся
 реализовать ABI IOGPU** на клиенте `IOAcceleratorES`, то есть ещё один протокол поверх того, что
-`RedwoodGPU` уже говорит на языке msm DRM для Mesa.
+`HakiosGPU` уже говорит на языке msm DRM для Mesa.
 
 ### Три пути и их цена
 
 **(А) Поверхность Metal над Mesa.** Дописать на уже существующую службу `IOAcceleratorES` (раздел 2)
-два свойства, положить в образ `/System/Library/Extensions/RedwoodMetal.bundle`
+два свойства, положить в образ `/System/Library/Extensions/HakiosMetal.bundle`
 (место открыто: `userland/build.sh` собирает корень из файлов iOS по их настоящим путям и уже
-кладёт туда свои — например `/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver`) и реализовать
+кладёт туда свои — например `/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver`) и реализовать
 граф объектов Metal на Mesa. Цена: ~53 класса и ~1 200 методов драйвера **плюс компилятор
 AIR→NIR**, которого не существует. В единицах этого проекта — не файл и не два, а ещё одна Mesa, и
 худшая её половина — без апстрима.
@@ -258,7 +258,7 @@ CoreAnimation — рендерер OpenGL ES, который порт уже и 
 
 1. службы класса `IOAcceleratorES` и у каждой — `MetalPluginName` и `MetalPluginClassName`
    (сейчас: ни одной, и значит Metal не найдёт устройства вовсе);
-2. что в реестре **есть** похожего на GPU — `RedwoodGPU`, `IOGPU`, `AGXAccelerator`,
+2. что в реестре **есть** похожего на GPU — `HakiosGPU`, `IOGPU`, `AGXAccelerator`,
    `IOAccelerator` — и с каким `IOUserClientClass`: видно, что GPU поднят, но под другим именем;
 3. бандлы в `/System/Library/Extensions`: грузится ли принципиальный класс каждого и является ли он
    подклассом `_MTLDevice`, — то есть мог ли бы вообще загрузиться плагин в этом образе, и на каком
@@ -310,7 +310,7 @@ XL_CMDLINE="... gpu=1" RC_JOBS=rc.jobs.metal ./xl run        # на телефо
 ```
 
 **Разница между QEMU и телефоном ровно одна**, и её стоит знать, читая вывод: пункт 2 показывает
-`RedwoodGPU` только на телефоне. `RedwoodGPUStart()` зовётся из `bsd/dev/redwood_adreno.c` (строка
+`HakiosGPU` только на телефоне. `HakiosGPUStart()` зовётся из `bsd/dev/hakios.adreno.c` (строка
 3858) лишь тогда, когда GPU действительно поднялся (`done >= 21 && core_runs`, то есть `gpu=1` и
 прошивки из `fw-gpu/`); в QEMU GPU нет вовсе, и служб не будет никаких. Про само Metal ответ
 одинаков: устройства нет ни там, ни там.
@@ -443,7 +443,7 @@ OpenGL ES.
 стоит настоящий Adreno через freedreno:
 
 ```
-redwood-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa):
+hakios-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa):
             OpenGL ES 3.2 Mesa 25.0.7; Adreno 7c+ Gen 3; shaders OpenGL ES GLSL ES 3.20
 metal_test:   EAGLContext: EAGLContext, API 3
 metal_test:     signal 11 at address 0x8
@@ -482,10 +482,10 @@ CoreImage пошёл дальше:
 
 ```
 $ /redwood/bin/metal_test ci-eagl-software
-metal_test:   /redwood/lib/libredwood-gl.dylib loaded; EAGLContext is ours now
+metal_test:   /redwood/lib/libhakios.gl.dylib loaded; EAGLContext is ours now
 metal_test:   EAGLContext: EAGLContext, API 3
-redwood-gl: -sharegroup asked for: none (nothing here shares a context)
-redwood-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa): ...
+hakios-gl: -sharegroup asked for: none (nothing here shares a context)
+hakios-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa): ...
 metal_test:   CIContext: CIContext
 metal_test:   backend: OpenGL ES (CI::GLContext)
 metal_test:   the context's Metal device: nil
