@@ -481,6 +481,20 @@ IOMobileFramebuffer::start(IOService * provider)
 	return true;
 }
 
+/*
+ * Are the first `rows` rows of a surface, `columns` 32-bit pixels of each, inside the memory it
+ * has? Its stride, element height and size come from whoever made it, so they are checked here,
+ * before anything reads the rows: in 64 bits, so that nothing wraps.
+ */
+static bool
+surfaceHolds(const MiniIOSurface * s, uint64_t rows, uint64_t columns)
+{
+	if (rows == 0 || columns == 0) {
+		return true;
+	}
+	return (uint64_t) s->info.offset + (rows - 1) * s->info.bytesPerRow + columns * 4 <= s->info.allocSize;
+}
+
 /* Keep a small copy of the frame that is about to be shown (the surface is the whole screen). */
 void
 IOMobileFramebuffer::record(MiniIOSurface * s)
@@ -494,6 +508,10 @@ IOMobileFramebuffer::record(MiniIOSurface * s)
 		fFirstFrame = now;
 	}
 	if (fRecBase == NULL || fRecDone || s->info.width < fWidth || s->info.height < fHeight) {
+		return;
+	}
+	/* a surface whose rows do not fit in its memory is not read */
+	if (!surfaceHolds(s, fHeight, fWidth)) {
 		return;
 	}
 	absolutetime_to_nanoseconds(now - fFirstFrame, &since_first);
@@ -589,10 +607,14 @@ sample_at(int64_t i, int64_t in, int64_t out)
  * scaling a whole frame takes one processor some 9 ms, so with boot-arg fb_threads=N it is shared
  * out between N of them, each with rows of its own and a row of blending of its own.
  */
+/* A layer's rectangle on the panel, in pixels, further out than this is not drawn (the panel is a few thousand wide). */
+#define DST_LIMIT       (1 << 24)
+
 struct RowJob {
 	const uint8_t * pixels;
 	uint32_t        stride;
 	int32_t         sx, sy, sw, sh, px0, py0, px1, py1, cx0, cx1;
+	int32_t         ry0, ry1;       /* the rows of the rectangle that are on the panel: all that is looked at, whatever its size */
 	bool            filter, unscaled;
 };
 
@@ -697,9 +719,9 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		job = fb->fHelperJob;
 		IOLockUnlock(fb->fHelperLock);
 		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->py1 - job->py0;
-		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
+		rows = job->ry1 - job->ry0;
+		y0 = job->ry0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
+		y1 = job->ry0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
 		blend = fb->fHelperBlend[index];
 		fb->drawRows(job, y0, y1, blend);
 		IOLockLock(fb->fHelperLock);
@@ -738,12 +760,31 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
 		return;
 	}
-	/* the rectangle on the panel */
-	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
-	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
-	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
-	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
+	/* the rows and columns named must be in the surface's memory, whatever stride and size it was made with */
+	if (!surfaceHolds(s, (uint32_t) (sy + sh), (uint32_t) (sx + sw))) {
+		return;
+	}
+	/*
+	 * the rectangle on the panel, worked out in 64 bits: the request's numbers are the caller's, and a
+	 * rectangle of billions of rows is not drawn (nor looked at row by row)
+	 */
+	int64_t qx0 = (int64_t) dx * fPanelWidth / fWidth;
+	int64_t qy0 = (int64_t) dy * fPanelHeight / fHeight;
+	int64_t qx1 = ((int64_t) dx + dw) * fPanelWidth / fWidth;
+	int64_t qy1 = ((int64_t) dy + dh) * fPanelHeight / fHeight;
+
+	if (qx0 < -DST_LIMIT || qy0 < -DST_LIMIT || qx1 > DST_LIMIT || qy1 > DST_LIMIT) {
+		return;
+	}
+	px0 = (int32_t) qx0;
+	py0 = (int32_t) qy0;
+	px1 = (int32_t) qx1;
+	py1 = (int32_t) qy1;
 	if (px1 <= px0 || py1 <= py0) {
+		return;
+	}
+	/* nothing of it on the panel: nothing to draw (and the columns below are only worked out for ones that are) */
+	if (px1 <= 0 || px0 >= (int32_t) fPanelWidth || py1 <= 0 || py0 >= (int32_t) fPanelHeight) {
 		return;
 	}
 	/* (blending, a row of the picture mixed from two: room for it, for every one who draws rows) */
@@ -758,14 +799,24 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		}
 		fBlendRowSize = (uint32_t) sw;
 		fBlendRow = IONew(uint32_t, fBlendRowSize);
+		bool allocated = fBlendRow != NULL;
+
 		for (unsigned i = 0; i + 1 < fThreads; i++) {
 			fHelperBlend[i] = IONew(uint32_t, fBlendRowSize);
-			if (fHelperBlend[i] == NULL && fBlendRow != NULL) {
+			allocated = allocated && fHelperBlend[i] != NULL;
+		}
+		if (!allocated) {
+			/* every array that did get made is given back at the size it was made with, so that no later growth frees one with the wrong size */
+			if (fBlendRow != NULL) {
 				IODelete(fBlendRow, uint32_t, fBlendRowSize);
 				fBlendRow = NULL;
 			}
-		}
-		if (fBlendRow == NULL) {
+			for (unsigned i = 0; i + 1 < fThreads; i++) {
+				if (fHelperBlend[i] != NULL) {
+					IODelete(fHelperBlend[i], uint32_t, fBlendRowSize);
+					fHelperBlend[i] = NULL;
+				}
+			}
 			fBlendRowSize = 0;
 		}
 	}
@@ -795,10 +846,12 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.py1 = py1;
 	job.cx0 = cx0;
 	job.cx1 = cx1;
+	job.ry0 = py0 < 0 ? 0 : py0;
+	job.ry1 = py1 > (int32_t) fPanelHeight ? (int32_t) fPanelHeight : py1;
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
-		drawRows(&job, py0, py1, fBlendRow);
+		drawRows(&job, job.ry0, job.ry1, fBlendRow);
 		return;
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
@@ -808,7 +861,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	fHelperGeneration++;
 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
 	IOLockUnlock(fHelperLock);
-	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
+	drawRows(&job, job.ry0, job.ry0 + (int32_t) ((int64_t) (job.ry1 - job.ry0) / fThreads), fBlendRow);
 	IOLockLock(fHelperLock);
 	while (fHelpersBusy != 0) {
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
@@ -1251,7 +1304,6 @@ IOMobileFramebufferUserClient::vsync(void)
 	OSAsyncReference64 ref;
 	io_user_reference_t args[6];
 	uint64_t now;
-	bool send = false;
 
 	IOLockLock(fLock);
 	now = fVSyncTime;
@@ -1266,13 +1318,15 @@ IOMobileFramebufferUserClient::vsync(void)
 		args[3] = now >> 32;
 		args[4] = (uint32_t) fVSyncCount;
 		args[5] = fVSyncCount >> 32;
-		send = true;
 		armVSync();
-	}
-	IOLockUnlock(fLock);
-	if (send) {
+		/*
+		 * sent with the lock held: registerNotificationPort() swaps the port under this lock and
+		 * only then lets go of the old one, so the port in `ref` cannot be released while it is sent to
+		 * (the send does not wait: a full queue drops the message)
+		 */
 		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, 6, kIOUserNotifyOptionCanDrop);
 	}
+	IOLockUnlock(fLock);
 }
 
 IOReturn
