@@ -1541,7 +1541,20 @@ publishAccelerator(IOService * provider)
 	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
 
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
+		uint32_t metal = 0;
+
 		accelerator->setName("sgx");
+		/*
+		 * Boot-arg metal=1: say where Metal's device is (docs/metal-plan.md, step 1). Metal reads these two
+		 * properties, opens /System/Library/Extensions/<name>.bundle and takes the class (userland/src/HakiosMetal.m).
+		 * Never by default: with them a program that asks for Metal gets a device, and CoreAnimation would choose
+		 * Metal for the screen; until that device can draw, a screen drawn without it is the working one.
+		 */
+		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0) {
+			accelerator->setProperty("MetalPluginName", "HakiosMetal");
+			accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice");
+			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names HakiosMetal as its Metal plug-in\n");
+		}
 		accelerator->registerService();
 	}
 	OSSafeReleaseNULL(accelerator);
