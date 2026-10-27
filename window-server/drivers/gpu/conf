@@ -1,0 +1,9 @@
+# drivers/gpu/conf: the GPU.
+# CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel; "standard" files are always built.
+# tools/hakios-config.py reads this file; docs/drivers-config.md says what each word means and how it reaches XNU.
+
+driver ADRENO
+	file    bsd/dev/hakios.adreno.c
+	file    iokit/Kernel/hakios.gpu.cpp iokitcpp
+	help    the Adreno 642L of the SC7280 woken step by step (adreno=N), and HakiosGPU, the IOKit service Mesa and
+	help    the window server draw through (gpu=1, adreno_keep=1). Needs the GPU's firmware from the phone (fw-gpu/)
