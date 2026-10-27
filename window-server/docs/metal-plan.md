@@ -68,6 +68,13 @@ Run in a loop of rebuild-image, boot, read the log; each pass gave the next requ
    and will then ask the device for a library from it, which is where the shader compiler (part A) is first needed for real.
    Where CoreAnimation takes that URL from is not known yet; the log shows the device was asked for nothing before it.
 
+7. **Who is shown the device**, then, is a boot-arg level (the plug-in reads `sysctl kern.bootargs`): `metal=1` only the program
+   `metal_test`, `metal=2` every process but the window server, `metal=3` every process. With the window server shown the device
+   it stops on the missing metallib (QuartzCore.framework has a `default.pipelinelib` that names a `default.metallib` which is
+   not in this image), so it cannot run on Metal here, and it has to be left on its OpenGL ES path. With `mediaserverd` shown it, it
+   ends and starts again. At `metal=1` the window server, SpringBoard and mediaserverd were each logged as not shown the device
+   and none of them ended in a QEMU run (the result of `metal_test` itself is not in this file yet).
+
 So the road from here is the library (step 4 of the order below: `newLibraryWithURL:` / `…Data:` through the AIR compiler), then
 buffers and textures with real memory, and the command encoders; none of that can be tried without the GPU.
 
