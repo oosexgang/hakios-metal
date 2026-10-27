@@ -54,8 +54,22 @@ Run in a loop of rebuild-image, boot, read the log; each pass gave the next requ
    window server restarts and fails the same way (launchd: "service has crashed N times in a row"). That is what a Metal
    device that exists and cannot do anything does to the system, and the reason `metal=1` is off by default.
 
-So the road from here is step 3 onwards, and the first thing the window server needs is a **command queue** (step 5), with
-buffers and textures under it; none of that can be tried without the GPU.
+4. **A command queue** is now made (`HakiosMetalQueue`, a subclass of `_MTLCommandQueue`; it queues nothing). Metal then
+   sends it `-setCompletionQueue:`, which is not in `MTLCommandQueue` but in the private protocol `MTLCommandQueueSPI`: found
+   by taking every protocol of the process whose name begins with `MTLCommandQueue`. The window server then asks for
+   `-setGPUPriority:` and `-newDepthStencilStateWithDescriptor:`.
+5. **The objects a device hands out** are stub classes made from a table in `HakiosMetal.m` (depth-stencil state, sampler
+   state, texture, render and compute pipeline states, event, fence): a subclass of Metal's private base where the system has
+   one, the protocol family declared, every other message logged once and answered with zero. Textures and events have no
+   private base class on this system (NSObject is used).
+6. **The next wall**, with those in place: CoreAnimation's Metal renderer stops with
+   `Assertion failed: (metallib_url != nil), function MetalContext, file ogl-metal.mm, line 3308.` It needs the URL of a
+   `.metallib` (the system has `AppleMetalGLRenderer.bundle/default.metallib`, 274 shader modules, which the AIR work translates)
+   and will then ask the device for a library from it, which is where the shader compiler (part A) is first needed for real.
+   Where CoreAnimation takes that URL from is not known yet; the log shows the device was asked for nothing before it.
+
+So the road from here is the library (step 4 of the order below: `newLibraryWithURL:` / `…Data:` through the AIR compiler), then
+buffers and textures with real memory, and the command encoders; none of that can be tried without the GPU.
 
 ## Frame skips
 
