@@ -310,6 +310,61 @@ the_device(void)
 	    (int)[device supportsFamily:MTLGPUFamilyApple1], (int)[device supportsFamily:MTLGPUFamilyApple4]);
 }
 
+/*
+ * What the device can make (HakiosMetal's step two, docs/metal-plan.md): a buffer written and read back through -contents, a
+ * copy, and the library of the OpenGL ES-on-Metal renderer the system carries, its functions by name. Run in a process of its
+ * own: a device that cannot do something may end the process that asks.
+ */
+#define GL_RENDERER_LIBRARY "/System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib"
+
+static void
+device_objects(void)
+{
+	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+	NSError *error = nil;
+
+	if (device == nil) {
+		printf("metal_test:   no device: nothing to ask\n");
+		return;
+	}
+	id<MTLBuffer> buffer = [device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+	if (buffer == nil) {
+		printf("metal_test:   newBufferWithLength:65536 = nil\n");
+	} else {
+		uint32_t *words = [buffer contents], bad = 0;
+
+		for (uint32_t i = 0; i < 16384; i++) {
+			words[i] = i * 2654435761u;
+		}
+		for (uint32_t i = 0; i < 16384; i++) {
+			bad += words[i] != i * 2654435761u;
+		}
+		printf("metal_test:   a buffer of %lu bytes (class %s, storage mode %lu): written and read back, %u words wrong\n",
+		    (unsigned long)[buffer length], class_getName([(id)buffer class]), (unsigned long)[buffer storageMode], bad);
+	}
+	static const char text[] = "the bytes of a buffer made with newBufferWithBytes:";
+	id<MTLBuffer> copy = [device newBufferWithBytes:text length:sizeof(text) options:0];
+	printf("metal_test:   newBufferWithBytes: %s\n", copy == nil ? "nil" :
+	    memcmp([copy contents], text, sizeof(text)) == 0 ? "a copy of them" : "SOMETHING ELSE");
+
+	id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@GL_RENDERER_LIBRARY] error:&error];
+	if (library == nil) {
+		printf("metal_test:   newLibraryWithURL:%s = nil (%s)\n", GL_RENDERER_LIBRARY, [[error localizedDescription] UTF8String]);
+		return;
+	}
+	NSArray<NSString *> *names = [library functionNames];
+	unsigned kinds[4] = { 0 };
+	for (NSString *name in names) {
+		id<MTLFunction> f = [library newFunctionWithName:name];
+		unsigned long type = f != nil ? [f functionType] : 0;
+
+		kinds[type == MTLFunctionTypeVertex ? 0 : type == MTLFunctionTypeFragment ? 1 : type == MTLFunctionTypeKernel ? 2 : 3]++;
+	}
+	printf("metal_test:   the GL renderer's library (class %s): %lu functions, %u vertex, %u fragment, %u kernel, %u other%s%s\n",
+	    class_getName([(id)library class]), (unsigned long)[names count], kinds[0], kinds[1], kinds[2], kinds[3],
+	    [names count] ? "; the first is " : "", [names count] ? [names[0] UTF8String] : "");
+}
+
 /* What iOS publishes about graphics besides: artwork, not rendering (see the note above). */
 static void
 gestalt(void)
@@ -532,6 +587,8 @@ main(int argc, char **argv)
 			coreimage();
 		} else if (strcmp(argv[1], "plugins") == 0) {
 			plugins();
+		} else if (strcmp(argv[1], "objects") == 0) {
+			device_objects();
 		} else {
 			printf("metal_test: no such question: %s\n", argv[1]);
 			return 2;
@@ -545,6 +602,7 @@ main(int argc, char **argv)
 	gpu_services();
 	printf("metal_test: the device a program gets\n");
 	the_device();
+	in_a_new_process("what the device makes: buffers, a library", "objects", 60);
 	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
 	gestalt();
 	printf("metal_test: CoreImage, which has a path without Metal\n");
