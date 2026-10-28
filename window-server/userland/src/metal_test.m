@@ -556,6 +556,59 @@ coreimage(void)
 	}
 }
 
+/*
+ * Blits through Metal's own API, as any program would ask for them: a queue, a command buffer, a blit encoder, copy and
+ * fill, commit, and the bytes checked when it is done. With hakios-metal and gpu=1 the GPU's command processor does the
+ * work (HakiosMetal.m, hakios-metal's CP_MEMCPY and CP_MEM_WRITE); without, the queue makes no command buffers and this says so.
+ */
+static void
+blits(void)
+{
+	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+	const NSUInteger n = 1 << 20;
+
+	if (device == nil) {
+		printf("metal_test:   no device\n");
+		return;
+	}
+	id<MTLCommandQueue> queue = [device newCommandQueue];
+	id<MTLBuffer> a = [device newBufferWithLength:n options:MTLResourceStorageModeShared];
+	id<MTLBuffer> b = [device newBufferWithLength:n options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+
+	printf("metal_test:   queue %s, buffers at GPU addresses 0x%llx and 0x%llx, command buffer %s\n", queue ? "made" : "nil",
+	    (unsigned long long)a.gpuAddress, (unsigned long long)b.gpuAddress, cb ? object_getClassName(cb) : "nil");
+	if (queue == nil || a == nil || b == nil || cb == nil) {
+		printf("metal_test:   no blits: the device has no GPU queue (gpu=1, and the plug-in built with hakios-metal)\n");
+		return;
+	}
+	uint32_t *pa = a.contents;
+	for (NSUInteger i = 0; i < n / 4; i++) {
+		pa[i] = (uint32_t)(i * 2654435761u);
+	}
+	memset(b.contents, 0, n);
+	__block int handled = 0;
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	[blit copyFromBuffer:a sourceOffset:4096 toBuffer:b destinationOffset:8192 size:500000];
+	[blit fillBuffer:b range:NSMakeRange(600000, 4096) value:0xa5];
+	[blit endEncoding];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> done) { handled = done.status == MTLCommandBufferStatusCompleted ? 1 : -1; }];
+	uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	[cb commit];
+	[cb waitUntilCompleted];
+	uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	uint8_t *pb = b.contents;
+	int same = memcmp(pb + 8192, (uint8_t *)pa + 4096, 500000) == 0, filled = 1, edges = pb[8191] == 0 && pb[8192 + 500000] == 0;
+	for (NSUInteger i = 600000; i < 604096; i++) {
+		filled = filled && pb[i] == 0xa5;
+	}
+	printf("metal_test:   blits: status %lu%s, handler %s, copy %s, fill %s, edges %s, %llu us\n", (unsigned long)cb.status,
+	    cb.error ? [[NSString stringWithFormat:@" (%@)", cb.error.localizedDescription] UTF8String] : "",
+	    handled == 1 ? "ran" : handled ? "saw an error" : "DID NOT RUN", same ? "ok" : "WRONG", filled ? "ok" : "WRONG",
+	    edges ? "untouched" : "CHANGED", (unsigned long long)((t1 - t0) / 1000));
+	printf("metal_test:   blits %s\n", cb.status == MTLCommandBufferStatusCompleted && handled == 1 && same && filled && edges ? "WORK" : "FAILED");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -589,6 +642,8 @@ main(int argc, char **argv)
 			plugins();
 		} else if (strcmp(argv[1], "objects") == 0) {
 			device_objects();
+		} else if (strcmp(argv[1], "blits") == 0) {
+			blits();
 		} else {
 			printf("metal_test: no such question: %s\n", argv[1]);
 			return 2;
@@ -603,6 +658,7 @@ main(int argc, char **argv)
 	printf("metal_test: the device a program gets\n");
 	the_device();
 	in_a_new_process("what the device makes: buffers, a library", "objects", 60);
+	in_a_new_process("blits through Metal: copy and fill, done by the GPU", "blits", 60);
 	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
 	gestalt();
 	printf("metal_test: CoreImage, which has a path without Metal\n");
