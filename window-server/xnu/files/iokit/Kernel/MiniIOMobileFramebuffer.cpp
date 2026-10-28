@@ -291,6 +291,8 @@ public:
 	uint64_t        fFirstFrame, fRecFirst; /* when the first frame was shown, and the first recorded */
 	bool            fRecDone;
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
+	uint64_t        fRecCost, fRecCostMax;  /* what copying the recorded frames took (mach_absolute_time), and the worst */
+	uint32_t        fRecCosted;             /* ... of how many frames: a line every 120 */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
@@ -554,6 +556,16 @@ IOMobileFramebuffer::record(MiniIOSurface * s)
 		}
 	}
 	fRecUsed += frame_size;
+	/* what the copy cost: it runs in the display's thread, between one frame and the next */
+	now = mach_absolute_time() - now;
+	fRecCost += now;
+	fRecCostMax = now > fRecCostMax ? now : fRecCostMax;
+	if (++fRecCosted == 120) {
+		IOLog("MiniIOMobileFramebuffer: recording a frame took %llu us on average, %llu at worst (the last 120)\n",
+		    micros(fRecCost) / 120, micros(fRecCostMax));
+		fRecCost = fRecCostMax = 0;
+		fRecCosted = 0;
+	}
 	if (!fRecWrapped) {
 		header->frames++;
 		loader_recording[1] = fRecUsed;
