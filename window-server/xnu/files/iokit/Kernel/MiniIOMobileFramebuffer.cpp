@@ -188,7 +188,8 @@ micros(uint64_t absolute)
  * and this driver only writes into the memory it scans, so fb_hz says how often frames are made, not how often the
  * panel shows one. The frame counter of the controller's DSI interface (SM7325's DPU: INTF_1 at 0x0ae36000,
  * INTF_FRAME_COUNT at 0xac, as Linux's catalogue for sc7280 has them) is read twice, a second apart, and the
- * difference printed. Reads only, once, at start; off by default.
+ * difference printed. Reads only, once, a minute after the driver starts (what the kernel says in its first minute
+ * does not come back with the phone's log), in a thread of its own; off by default.
  */
 static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
 #define DPU_INTF1_PAGE          0x0ae34000UL            /* the 16 KB page INTF_1 is in */
@@ -199,14 +200,12 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 static inline uint32_t refreshHz(void);
 
 static void
-measurePanel(void)
+measurePanel(__unused void * arg, __unused wait_result_t wr)
 {
 	vm_offset_t intf;
 	uint32_t on, first, second;
 
-	if (!gMeasure) {
-		return;
-	}
+	IOSleep(60000);
 	intf = ml_io_map(DPU_INTF1_PAGE, 0x4000) + DPU_INTF1_OFFSET;
 	on = *(volatile uint32_t *)(intf + INTF_TIMING_ENGINE_EN);
 	first = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
@@ -434,7 +433,9 @@ IOMobileFramebuffer::start(IOService * provider)
 		    vinfo.v_depth);
 		return false;
 	}
-	measurePanel();
+	if (gMeasure && kernel_thread_start(measurePanel, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
 	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
