@@ -183,6 +183,39 @@ micros(uint64_t absolute)
 	return ns / 1000;
 }
 
+/*
+ * Boot-arg fb_measure=1: how often the panel is really refreshed. The boot loader leaves the display controller running
+ * and this driver only writes into the memory it scans, so fb_hz says how often frames are made, not how often the
+ * panel shows one. The frame counter of the controller's DSI interface (SM7325's DPU: INTF_1 at 0x0ae36000,
+ * INTF_FRAME_COUNT at 0xac, as Linux's catalogue for sc7280 has them) is read twice, a second apart, and the
+ * difference printed. Reads only, once, at start; off by default.
+ */
+static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
+#define DPU_INTF1_PAGE          0x0ae34000UL            /* the 16 KB page INTF_1 is in */
+#define DPU_INTF1_OFFSET        0x2000
+#define INTF_TIMING_ENGINE_EN   0x000
+#define INTF_FRAME_COUNT        0x0ac
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+static inline uint32_t refreshHz(void);
+
+static void
+measurePanel(void)
+{
+	vm_offset_t intf;
+	uint32_t on, first, second;
+
+	if (!gMeasure) {
+		return;
+	}
+	intf = ml_io_map(DPU_INTF1_PAGE, 0x4000) + DPU_INTF1_OFFSET;
+	on = *(volatile uint32_t *)(intf + INTF_TIMING_ENGINE_EN);
+	first = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
+	IOSleep(1000);
+	second = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT);
+	IOLog("MiniIOMobileFramebuffer: the panel: DSI interface's timing engine %s, %u refreshes in one second "
+	    "(frames are made at %u a second: fb_hz)\n", (on & 1) ? "on" : "OFF", second - first, refreshHz());
+}
+
 static inline uint32_t
 refreshHz(void)
 {
@@ -401,6 +434,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		    vinfo.v_depth);
 		return false;
 	}
+	measurePanel();
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
 	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
