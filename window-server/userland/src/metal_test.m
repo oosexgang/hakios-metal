@@ -402,7 +402,7 @@ static NSDictionary *coreimage_options;
 static int coreimage_over_eagl;
 
 /*
- * The way back for CoreImage, if there is one. Darwin userland 16.5's CoreImage carries a whole second back
+ * The way back for CoreImage, if there is one. Darwin 16.5's CoreImage carries a whole second back
  * end on OpenGL ES -- CI::GLContext, CI::GLMainProgram, CI::GLTextureManager beside the
  * CI::MetalContext family -- it is linked against OpenGLES, it compiles its shaders as GLSL (not
  * AIR), and CIGLIsUsable() is compiled to "return 1". The public way in is
