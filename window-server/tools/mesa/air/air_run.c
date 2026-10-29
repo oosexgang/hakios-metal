@@ -55,7 +55,7 @@
 #include <mach-o/dyld.h>
 #include <signal.h>
 /* <sys/ucontext.h>, not <ucontext.h>: the latter refuses to be included
- * without _XOPEN_SOURCE on the iOS SDK, and userland/src/inject.c takes the
+ * without _XOPEN_SOURCE on the Darwin SDK, and userland/src/inject.c takes the
  * same route for the same reason.
  */
 #include <sys/ucontext.h>
@@ -104,7 +104,7 @@ texel_value(unsigned slot, unsigned x, unsigned y, unsigned z, float out[4])
  * print the fault before dying. These two functions are userland/src/inject.c's
  * say_the_fault()/watch_for_faults() (branch sileo2, 6683521), with the slide
  * taken from this program's own image rather than from the shared cache, since
- * the pc of interest is in air_run or in libOSMesa and not in iOS.
+ * the pc of interest is in air_run or in libOSMesa and not in Darwin.
  */
 static void
 say_the_fault(int signal_number, siginfo_t *info, void *context_in)
@@ -762,7 +762,7 @@ main(int argc, char **argv)
     */
    bool want_library = false;
    /* --buffer FILE is AIR_RUN_BUFFER as an argument, and it exists because the
-    * device has no shell to set one with. iOS 16.5's own root carries no sh at
+    * device has no shell to set one with. Darwin userland 16.5's own root carries no sh at
     * all -- /bin holds df and ps -- and the job list that runs this is read by
     * our init, which splits a line on blanks and has no notion of a variable
     * (userland/src/init.c, run_command). So a generated suite whose every

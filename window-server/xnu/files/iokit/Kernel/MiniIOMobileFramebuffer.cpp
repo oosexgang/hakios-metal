@@ -7,7 +7,7 @@
  * surfaces of its layers into that memory, and "vsync" is a timer.
  *
  * The protocol (selectors and the layout of the swap request) was worked out from the
- * user-space side of iOS 16.5. Everything not implemented is logged once.
+ * user-space side of Darwin userland 16.5. Everything not implemented is logged once.
  */
 
 #include <IOKit/IOLib.h>
@@ -39,7 +39,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 
-/* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
+/* IOConnectCallMethod selectors of the framebuffer user client (Darwin userland 16.5) */
 enum {
 	kFBMethodGetLayerDefaultSurface = 3,
 	kFBMethodSwapBegin              = 4,
@@ -90,7 +90,7 @@ static uint8_t  gFBCalls[128];          /* how many calls of each selector were 
 
 /*
  * The display user space is told about. The system carries the identity of the iPhone X
- * (see the loader), and iOS knows what screen that phone has: with any other size
+ * (see the loader), and Darwin knows what screen that phone has: with any other size
  * MobileGestalt reports an unknown screen class and the user interface has no layout for it.
  * So the display is always the iPhone's, and a swap scales the picture to the panel that is
  * really there (in QEMU the loader makes the panel exactly this size and nothing is scaled).
@@ -133,7 +133,7 @@ static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
  * frames to be matched with what the window server's per-frame lines (glframes=1,
  * userland/src/eagl.c) say. rec_step=N (2 to 8, default 3) keeps one pixel of every N instead of 3:
  * N = 4 holds 1.8 times as many frames, 6 four times. The memory is taken from the system's for the
- * whole run: 640 MB of it under a long session of applications had iOS killing processes for
+ * whole run: 640 MB of it under a long session of applications had Darwin killing processes for
  * memory, SpringBoard and the window server among them (two respring in one run); 256 did not.
  */
 static TUNABLE(uint32_t, gRecSeconds, "rec_secs", 0);
