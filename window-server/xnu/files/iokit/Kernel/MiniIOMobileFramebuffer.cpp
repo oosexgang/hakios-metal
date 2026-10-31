@@ -328,6 +328,7 @@ public:
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
+	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
@@ -368,6 +369,34 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
  */
 #define kFBTimingID     1
 #define kFBColorID      1
+
+/*
+ * The refresh the window server clocks its frames by: the property IOMFBDisplayRefresh, a dictionary of the shortest
+ * interval between refreshes, the longest, and the step between them, in mach_absolute_time units (QuartzCore,
+ * windowserver-apple-display.cpp: displayMinRefreshInterval, displayRefreshStepMachTime; CoreMedia's FPSupport:
+ * displayMaxRefreshInterval, displayRefreshStep). Without it CoreAnimation takes a built-in panel for a 60 Hz one
+ * whatever its timing says: the mode it makes is "internal_panel (fixed)" at 60, UIScreen's maximumFramesPerSecond is
+ * 60, and frames came at 60 on the 120 Hz panel (userland/src/fps_info.m, 30 October). This panel does not vary its
+ * rate, so all three are the one interval, fb_hz's.
+ */
+void
+IOMobileFramebuffer::publishRefresh(void)
+{
+	OSDictionary * refresh = OSDictionary::withCapacity(4);
+	uint64_t interval;
+
+	if (refresh == NULL) {
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &interval);
+	setNumber(refresh, "displayMinRefreshInterval", interval);
+	setNumber(refresh, "displayMaxRefreshInterval", interval);
+	setNumber(refresh, "displayRefreshStep", interval);
+	setNumber(refresh, "displayRefreshStepMachTime", interval);
+	setProperty("IOMFBDisplayRefresh", refresh);
+	refresh->release();
+	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz, an interval of %llu ticks\n", refreshHz(), interval);
+}
 
 void
 IOMobileFramebuffer::publishModes(void)
@@ -412,6 +441,7 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	publishRefresh();
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
 	OSSafeReleaseNULL(timing);
