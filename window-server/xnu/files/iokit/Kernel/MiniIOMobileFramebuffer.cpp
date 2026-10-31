@@ -372,30 +372,34 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
 
 /*
  * The refresh the window server clocks its frames by: the property IOMFBDisplayRefresh, a dictionary of the shortest
- * interval between refreshes, the longest, and the step between them, in mach_absolute_time units (QuartzCore,
- * windowserver-apple-display.cpp: displayMinRefreshInterval, displayRefreshStepMachTime; CoreMedia's FPSupport:
- * displayMaxRefreshInterval, displayRefreshStep). Without it CoreAnimation takes a built-in panel for a 60 Hz one
- * whatever its timing says: the mode it makes is "internal_panel (fixed)" at 60, UIScreen's maximumFramesPerSecond is
- * 60, and frames came at 60 on the 120 Hz panel (userland/src/fps_info.m, 30 October). This panel does not vary its
- * rate, so all three are the one interval, fb_hz's.
+ * interval between refreshes, the longest, and the step between them (QuartzCore, windowserver-apple-display.cpp:
+ * displayMinRefreshInterval, displayRefreshStepMachTime; CoreMedia's FPSupport: displayMaxRefreshInterval,
+ * displayRefreshStep). Without it CoreAnimation takes a built-in panel for a 60 Hz one whatever its timing says: the
+ * mode it makes is "internal_panel (fixed)" at 60, UIScreen's maximumFramesPerSecond is 60, and frames came at 60 on
+ * the 120 Hz panel (userland/src/fps_info.m, 30 October).
+ * The intervals are in units of 2^-32 of a second (32.32 fixed point), not in mach_absolute_time's: given 1/120 s in
+ * the phone's ticks (160000 of 19.2 MHz) CoreAnimation answered a refresh rate of 26844 a second, which is
+ * 2^32 / 160000. Only the step whose name says MachTime is in ticks. This panel does not vary its rate, so all of
+ * them are the one interval, fb_hz's.
  */
 void
 IOMobileFramebuffer::publishRefresh(void)
 {
 	OSDictionary * refresh = OSDictionary::withCapacity(4);
-	uint64_t interval;
+	uint64_t interval = (1ULL << 32) / refreshHz(), ticks;
 
 	if (refresh == NULL) {
 		return;
 	}
-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &interval);
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &ticks);
 	setNumber(refresh, "displayMinRefreshInterval", interval);
 	setNumber(refresh, "displayMaxRefreshInterval", interval);
 	setNumber(refresh, "displayRefreshStep", interval);
-	setNumber(refresh, "displayRefreshStepMachTime", interval);
+	setNumber(refresh, "displayRefreshStepMachTime", ticks);
 	setProperty("IOMFBDisplayRefresh", refresh);
 	refresh->release();
-	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz, an interval of %llu ticks\n", refreshHz(), interval);
+	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz, an interval of %llu (2^-32 s), %llu ticks\n",
+	    refreshHz(), interval, ticks);
 }
 
 void
