@@ -152,6 +152,13 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  */
 static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
+/*
+ * Boot-arg fb_ca_hz=N: the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's. On
+ * this system CoreAnimation draws at half the rate it is told unless something asks it for more: told 120 it gave 60
+ * (tools/frames.py: frames every 16.7 ms, with or without CADisableMinimumFrameDurationOnPhone, CA_FORCE_120HZ and
+ * CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION=0, 30 October). The refreshes themselves still come at fb_hz.
+ */
+static TUNABLE(uint32_t, gCARefreshHz, "fb_ca_hz", 0);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
@@ -386,20 +393,21 @@ void
 IOMobileFramebuffer::publishRefresh(void)
 {
 	OSDictionary * refresh = OSDictionary::withCapacity(4);
-	uint64_t interval = (1ULL << 32) / refreshHz(), ticks;
+	uint32_t told = gCARefreshHz >= 1 && gCARefreshHz <= 480 ? gCARefreshHz : refreshHz();
+	uint64_t interval = (1ULL << 32) / told, ticks;
 
 	if (refresh == NULL) {
 		return;
 	}
-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &ticks);
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / told, &ticks);
 	setNumber(refresh, "displayMinRefreshInterval", interval);
 	setNumber(refresh, "displayMaxRefreshInterval", interval);
 	setNumber(refresh, "displayRefreshStep", interval);
 	setNumber(refresh, "displayRefreshStepMachTime", ticks);
 	setProperty("IOMFBDisplayRefresh", refresh);
 	refresh->release();
-	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz, an interval of %llu (2^-32 s), %llu ticks\n",
-	    refreshHz(), interval, ticks);
+	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz (the panel: %u), an interval of %llu (2^-32 s), %llu ticks\n",
+	    told, refreshHz(), interval, ticks);
 }
 
 void
