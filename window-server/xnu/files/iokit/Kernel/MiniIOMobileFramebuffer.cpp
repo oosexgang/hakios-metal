@@ -1496,7 +1496,12 @@ IOMobileFramebufferUserClient::vsync(void)
 		 * only then lets go of the old one, so the port in `ref` cannot be released while it is sent to
 		 * (the send does not wait: a full queue drops the message)
 		 */
-		sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, 6, kIOUserNotifyOptionCanDrop);
+		IOReturn sent = sendAsyncResult64WithOptions(ref, kIOReturnSuccess, args, 6, kIOUserNotifyOptionCanDrop);
+		if (gTouchLat) {
+			/* "tl: y COUNT due US at US SENT": the refresh told to the window server, when it was due, when it went, and
+			 * whether it went (0) or was dropped on a full queue -- for the window server's idle gaps (tools/frames.py) */
+			hakios_tl("tl: y %llu due %llu at %llu %#x\n", fVSyncCount, micros(now), micros(mach_absolute_time()), sent);
+		}
 	}
 	IOLockUnlock(fLock);
 }
