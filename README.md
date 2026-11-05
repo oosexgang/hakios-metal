@@ -1,5 +1,9 @@
 # hakios-metal
 
+> **Moved.** This driver is now developed in the kernel's repository, with its history:
+> [hakios-xnu-kernel/hakios-metal](https://github.com/oosexgang/hakios-xnu-kernel/tree/main/hakios-metal) (since kernel 2.3.3).
+> One checkout of the kernel builds it, and fixes go there. Nothing new lands here: this repository stays for the links to it.
+
 The Metal driver of [hakios](https://github.com/oosexgang/hakios), in C++: Metal's command model on the phone's
 Adreno GPU (an Adreno 7c+ Gen 3, chip id 0x06030500), through the kernel's own GPU driver (HakiosGPU), without Mesa
 in between.
